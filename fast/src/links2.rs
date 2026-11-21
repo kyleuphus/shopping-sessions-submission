@@ -235,6 +235,19 @@ impl PersonMap {
         }
     }
 
+    /// Hint the CPU to start loading the cache line that `get(key)` will probe
+    /// first. Purely a performance hint: it reads nothing and changes nothing,
+    /// so it cannot affect any result. Callers issue it some records ahead of
+    /// the matching `get` so the memory latency overlaps other work.
+    #[inline(always)]
+    pub fn prefetch(&self, key: IdKey) {
+        let slot = home_slot(key, self.mask);
+        // `wrapping_add` + a prefetch never dereference: even an out-of-range
+        // address would just be an ignored hint. `slot <= mask < len` anyway.
+        let ptr = self.slots.as_ptr().wrapping_add(slot) as *const u8;
+        prefetch_read(ptr);
+    }
+
     pub fn len(&self) -> usize {
         self.len
     }
@@ -242,6 +255,23 @@ impl PersonMap {
     pub fn is_empty(&self) -> bool {
         self.len == 0
     }
+}
+
+/// Software prefetch of one cache line into L1 (no-op on other targets).
+#[inline(always)]
+fn prefetch_read(ptr: *const u8) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: a prefetch is a hint; it never faults or reads into the program.
+    unsafe {
+        core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(ptr as *const i8);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above; `prfm` is a hint instruction.
+    unsafe {
+        core::arch::asm!("prfm pldl1keep, [{0}]", in(reg) ptr, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = ptr;
 }
 
 struct Timer {

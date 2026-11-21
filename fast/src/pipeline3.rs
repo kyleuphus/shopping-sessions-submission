@@ -280,20 +280,46 @@ fn parse_digits(bytes: &[u8]) -> Option<i64> {
 
 struct Stages {
     enabled: bool,
+    /// `FAST_TIMING=2`: also print each stage's start and end as raw
+    /// CLOCK_MONOTONIC nanoseconds plus the pid, so a `perf record` taken on
+    /// the x86 profiler can be sliced by stage.
+    raw: bool,
     last: Instant,
+    last_ns: u64,
+}
+
+/// CLOCK_MONOTONIC in nanoseconds (the clock `perf` timestamps use on Linux).
+fn monotonic_ns() -> u64 {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid pointer to a timespec; CLOCK_MONOTONIC always exists.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
 
 impl Stages {
     fn new() -> Self {
+        let timing = std::env::var("FAST_TIMING").ok();
         Self {
-            enabled: std::env::var_os("FAST_TIMING").is_some(),
+            enabled: timing.is_some(),
+            raw: timing.as_deref() == Some("2"),
             last: Instant::now(),
+            last_ns: monotonic_ns(),
         }
     }
 
     fn mark(&mut self, label: &str) {
         if self.enabled {
             eprintln!("  v3 {label:<25} {:>8.3}s", self.last.elapsed().as_secs_f64());
+        }
+        if self.raw {
+            let now = monotonic_ns();
+            eprintln!(
+                "  v3stage pid={} label=\"{label}\" start_ns={} end_ns={}",
+                std::process::id(),
+                self.last_ns,
+                now
+            );
+            self.last_ns = now;
         }
         self.last = Instant::now();
     }
@@ -333,7 +359,23 @@ impl Parts {
 /// order, items within a group in input order. Returns the scattered items,
 /// the offset table (`groups + 1` entries; group g is `off[g]..off[g+1]`), and
 /// each input item's final position.
-fn counting_scatter<T: Copy + Default>(items: &[T], tags: &[u16], groups: usize) -> (Vec<T>, Vec<u32>, Vec<u32>) {
+fn counting_scatter<T: Copy>(items: &[T], tags: &[u16], groups: usize) -> (Vec<T>, Vec<u32>, Vec<u32>) {
+    let mut pos = Vec::with_capacity(items.len());
+    let (out, off) = scatter_map(items, tags, groups, |item| item, |at| pos.push(at));
+    (out, off, pos)
+}
+
+/// The scatter itself: like [`counting_scatter`] but writes `f(item)` (so a
+/// remap can be fused into the copy), reports each item's final position to
+/// `on_pos`, and writes straight into uninitialised memory (no zero-fill pass).
+fn scatter_map<T: Copy, U: Copy>(
+    items: &[T],
+    tags: &[u16],
+    groups: usize,
+    f: impl Fn(T) -> U,
+    mut on_pos: impl FnMut(u32),
+) -> (Vec<U>, Vec<u32>) {
+    assert_eq!(items.len(), tags.len());
     let mut off = vec![0u32; groups + 1];
     for &t in tags {
         off[t as usize + 1] += 1;
@@ -342,15 +384,19 @@ fn counting_scatter<T: Copy + Default>(items: &[T], tags: &[u16], groups: usize)
         off[g + 1] += off[g];
     }
     let mut cursor = off[..groups].to_vec();
-    let mut out = vec![T::default(); items.len()];
-    let mut pos = Vec::with_capacity(items.len());
+    let mut out: Vec<U> = Vec::with_capacity(items.len());
+    let slots = out.spare_capacity_mut();
     for (item, &t) in items.iter().zip(tags) {
         let at = &mut cursor[t as usize];
-        out[*at as usize] = *item;
-        pos.push(*at);
+        slots[*at as usize].write(f(*item));
+        on_pos(*at);
         *at += 1;
     }
-    (out, off, pos)
+    // SAFETY: the offsets are a prefix sum of the per-group counts, so the
+    // cursors hand out every index in 0..items.len() exactly once: all
+    // `items.len()` slots were written above.
+    unsafe { out.set_len(items.len()) };
+    (out, off)
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +420,13 @@ struct Ctx<'a> {
     /// See [`rec_index_bits`].
     k: u32,
     fallback: &'a Fallback,
+    /// Profiling only (`FAST_PARSE_LEVEL=n`, default 6 = full work): stop each
+    /// line after stage n (0 line scan only, 1 split, 2 ingest + event key, 3 validate,
+    /// 4 user key, 5 staging push + the per-chunk resolve_persons loop; 6 adds
+    /// the scatter), then stop the run after P without writing output. Stage
+    /// cost = difference between consecutive levels. Clicks: 1-2 split,
+    /// 3 validate, 4 user + click keys, 5 push + resolve, 6 scatter.
+    parse_level: u8,
 }
 
 impl Ctx<'_> {
@@ -435,14 +488,29 @@ struct CkChunk {
 
 fn parse_event_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChunk {
     let parts = ctx.parts;
-    let mut evs = Vec::new();
-    let mut ev_tag = Vec::new();
-    let mut toks = Vec::new();
-    let mut tok_tag = Vec::new();
-    let mut fields = Vec::with_capacity(8);
-    for_each_line(chunk, |line| {
-        // rules Events 1: malformed lines and empty event_id produce nothing.
-        if !split_fields(line, 7, &mut fields) || fields[0].is_empty() {
+    let level = ctx.parse_level;
+    // Pre-size staging from the chunk size (~70-byte event lines) so the
+    // pushes rarely reallocate and copy.
+    let estimate = chunk.bytes.len() / 64 + 16;
+    let mut evs = Vec::with_capacity(estimate);
+    let mut toks = Vec::with_capacity(estimate);
+    let mut tok_tag = Vec::with_capacity(estimate);
+    // Level 0 (profiling only): the old memchr line scan, no fields.
+    if level < 1 {
+        for_each_line(chunk, |line| {
+            std::hint::black_box(line);
+        });
+    }
+    let scan_bytes: &[u8] = if level < 1 { &[] } else { chunk.bytes };
+    // One SIMD pass per chunk; malformed lines never reach the closure.
+    crate::scan3::for_each_record::<7>(scan_bytes, chunk.has_header, |fields| {
+        let fields = *fields;
+        // rules Events 1: empty event_id produces nothing.
+        if fields[0].is_empty() {
+            return;
+        }
+        if level < 2 {
+            std::hint::black_box(&fields);
             return;
         }
         // rules: "ingest_ts is always valid F1", so use the F1-only parser.
@@ -458,19 +526,32 @@ fn parse_event_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChu
             return;
         }
         let ekey = key_of(fields[0], ctx.ids);
+        if level < 3 {
+            std::hint::black_box(ekey);
+            return;
+        }
+        let valid = ctx.validate_event(&fields, ingest_ms);
+        if level < 4 {
+            std::hint::black_box(valid);
+            return;
+        }
         // `rec` here is the staging index; it is remapped after the scatter.
-        let rec = match ctx.validate_event(&fields, ingest_ms) {
+        let rec = match valid {
             Some((event_ts, pc)) => {
                 let user = key_of(fields[1], ctx.ids);
-                let person = ctx.people.get(user).unwrap_or(user);
+                if level < 5 {
+                    std::hint::black_box(user);
+                    return;
+                }
                 let index = evs.len() as u32;
                 evs.push(Ev {
-                    person,
+                    // The raw user key for now; resolve_persons turns it into
+                    // the person key after the line loop.
+                    person: user,
                     // In [0, window_end - base) by the window check + window guard.
                     ts_rel: (event_ts - ctx.base) as u32,
                     pc,
                 });
-                ev_tag.push(parts.person(person) as u16);
                 index
             }
             None => NONE,
@@ -483,6 +564,17 @@ fn parse_event_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChu
         tok_tag.push(parts.event(ekey) as u16);
     });
 
+    let ev_tag = resolve_persons(ctx, &mut evs, |e| &mut e.person);
+    if level < 6 {
+        std::hint::black_box((&evs, &toks, &ev_tag, &tok_tag));
+        return EvChunk {
+            evs: Vec::new(),
+            ev_off: vec![0; parts.count() + 1],
+            toks: Vec::new(),
+            tok_off: vec![0; parts.count() + 1],
+            dead: Vec::new(),
+        };
+    }
     if evs.len() as u64 > 1u64 << ctx.k {
         ctx.fallback
             .trip(format!("event chunk {chunk_id} has {} records > 2^{}", evs.len(), ctx.k));
@@ -490,14 +582,16 @@ fn parse_event_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChu
 
     let groups = parts.count();
     let (evs, ev_off, pos) = counting_scatter(&evs, &ev_tag, groups);
-    // Point each token at its Ev's final slot in this chunk's buffer.
+    // Scatter the tokens, pointing each one at its Ev's final slot in this
+    // chunk's buffer as it is copied (the remap is fused into the scatter).
     let chunk_tag = (chunk_id as u32).wrapping_shl(ctx.k);
-    for tok in &mut toks {
+    let remap = |mut tok: Tok| {
         if tok.rec != NONE {
             tok.rec = chunk_tag | pos[tok.rec as usize];
         }
-    }
-    let (toks, tok_off, _) = counting_scatter(&toks, &tok_tag, groups);
+        tok
+    };
+    let (toks, tok_off) = scatter_map(&toks, &tok_tag, groups, remap, |_| {});
     let dead = (0..evs.len().div_ceil(64)).map(|_| AtomicU64::new(0)).collect();
     EvChunk {
         evs,
@@ -508,15 +602,49 @@ fn parse_event_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChu
     }
 }
 
+/// Replace each record's raw user key with its person key
+/// (`PersonMap::get(user).unwrap_or(user)`, rules Linked IDs) and return each
+/// record's person-partition tag.
+///
+/// Why a separate pass: the PersonMap is tens of MB, so nearly every lookup is
+/// a cache miss. Inside the branchy per-line parse loop the CPU can wait on
+/// only about one miss at a time; in this tight loop the lookups do not depend
+/// on each other, so the out-of-order core overlaps many of them.
+fn resolve_persons<T>(ctx: &Ctx<'_>, records: &mut [T], person: impl Fn(&mut T) -> &mut IdKey) -> Vec<u16> {
+    let parts = ctx.parts;
+    let mut tags = Vec::with_capacity(records.len());
+    // Prefetch the PersonMap slot of the record PREFETCH_AHEAD positions
+    // ahead, so its DRAM fetch is in flight by the time we look it up.
+    const PREFETCH_AHEAD: usize = 16;
+    let n = records.len();
+    for i in 0..n {
+        if i + PREFETCH_AHEAD < n {
+            let ahead = *person(&mut records[i + PREFETCH_AHEAD]);
+            ctx.people.prefetch(ahead);
+        }
+        let key = person(&mut records[i]);
+        *key = ctx.people.get(*key).unwrap_or(*key);
+        tags.push(parts.person(*key) as u16);
+    }
+    tags
+}
+
 fn parse_click_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>) -> CkChunk {
     let parts = ctx.parts;
+    let level = ctx.parse_level;
     let click_start = ctx.base;
-    let mut cks = Vec::new();
-    let mut tags = Vec::new();
+    let mut cks = Vec::with_capacity(chunk.bytes.len() / 48 + 16); // ~55-byte click lines
     let mut has_fallback_click = false;
-    let mut fields = Vec::with_capacity(4);
-    for_each_line(chunk, |line| {
-        if !split_fields(line, 4, &mut fields) {
+    if level < 1 {
+        for_each_line(chunk, |line| {
+            std::hint::black_box(line);
+        });
+    }
+    let scan_bytes: &[u8] = if level < 1 { &[] } else { chunk.bytes };
+    crate::scan3::for_each_record::<4>(scan_bytes, chunk.has_header, |fields| {
+        let fields = *fields;
+        if level < 3 {
+            std::hint::black_box(&fields);
             return;
         }
         let (click_id, user, campaign_id, ts_field) = (fields[0], fields[1], fields[2], fields[3]);
@@ -536,20 +664,35 @@ fn parse_click_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>) -> CkChunk {
         if campaign >= ctx.real_campaign_count {
             return; // `organic` is interned after the real campaigns
         }
+        if level < 4 {
+            std::hint::black_box((click_ts, campaign));
+            return;
+        }
         let user = key_of(user, ctx.ids);
-        let person = ctx.people.get(user).unwrap_or(user);
         let click = key_of(click_id, ctx.ids);
+        if level < 5 {
+            std::hint::black_box((user, click));
+            return;
+        }
         // A fallback key has length nibble 0 (key.rs).
         has_fallback_click |= click & 0x0f == 0;
         cks.push(Ck {
-            person,
+            person: user, // resolved after the line loop (resolve_persons)
             click,
             ts_rel: (click_ts - ctx.base) as u32,
             camp: campaign as u16,
         });
-        tags.push(parts.person(person) as u16);
     });
-    let (cks, ck_off, _) = counting_scatter(&cks, &tags, parts.count());
+    let tags = resolve_persons(ctx, &mut cks, |c| &mut c.person);
+    if level < 6 {
+        std::hint::black_box((&cks, &tags));
+        return CkChunk {
+            cks: Vec::new(),
+            ck_off: vec![0; parts.count() + 1],
+            has_fallback_click,
+        };
+    }
+    let (cks, ck_off) = scatter_map(&cks, &tags, parts.count(), |c| c, |_| {});
     CkChunk {
         cks,
         ck_off,
@@ -799,6 +942,135 @@ fn sort_clicks(cks: &mut [Ck], ids: &IdInterner, any_fallback: bool) {
     }
 }
 
+const NO_PERSON: u32 = u32::MAX;
+
+/// Person key -> dense id (first-insertion order) for one partition.
+/// Open addressing, linear probing, load <= 1/2; `NO_PERSON` marks an empty
+/// slot. Reused across partitions (`reset`). A partition holds a few hundred
+/// persons at 20M, so the table stays in L1/L2.
+#[derive(Default)]
+struct DenseIndex {
+    slots: Vec<(IdKey, u32)>,
+    mask: usize,
+    persons: Vec<IdKey>,
+}
+
+impl DenseIndex {
+    fn reset(&mut self, expected: usize) {
+        let cap = (expected.max(8) * 2).next_power_of_two();
+        self.slots.clear();
+        self.slots.resize(cap, (0, NO_PERSON));
+        self.mask = cap - 1;
+        self.persons.clear();
+    }
+
+    #[inline(always)]
+    fn slot_of(&self, key: IdKey) -> usize {
+        // Salted differently from the partition hash, whose top bits are
+        // equal for every key in this partition.
+        fmix64(key ^ 0x6465_6e73_655f_7633) as usize & self.mask
+    }
+
+    #[inline]
+    fn insert(&mut self, key: IdKey) -> u32 {
+        let mut slot = self.slot_of(key);
+        loop {
+            let (k, v) = self.slots[slot];
+            if v == NO_PERSON {
+                if (self.persons.len() + 1) * 2 > self.slots.len() {
+                    self.grow();
+                    return self.insert(key);
+                }
+                let dense = self.persons.len() as u32;
+                self.slots[slot] = (key, dense);
+                self.persons.push(key);
+                return dense;
+            }
+            if k == key {
+                return v;
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    #[inline]
+    fn get(&self, key: IdKey) -> u32 {
+        let mut slot = self.slot_of(key);
+        loop {
+            let (k, v) = self.slots[slot];
+            if v == NO_PERSON || k == key {
+                return v;
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    fn grow(&mut self) {
+        let cap = self.slots.len() * 2;
+        self.slots.clear();
+        self.slots.resize(cap, (0, NO_PERSON));
+        self.mask = cap - 1;
+        for (dense, &key) in self.persons.iter().enumerate() {
+            let mut slot = self.slot_of(key);
+            while self.slots[slot].1 != NO_PERSON {
+                slot = (slot + 1) & self.mask;
+            }
+            self.slots[slot] = (key, dense as u32);
+        }
+    }
+}
+
+/// Stable counting sort of `items` by `dense[i]` into `out`; records whose id
+/// is `NO_PERSON` are dropped. Group `g` is `out[off[g]..off[g+1]]`. Buffers
+/// are reused across partitions.
+fn group_by_dense<T: Copy>(items: &[T], dense: &[u32], groups: usize, out: &mut Vec<T>, off: &mut Vec<u32>) {
+    off.clear();
+    off.resize(groups + 1, 0);
+    for &d in dense {
+        if d != NO_PERSON {
+            off[d as usize + 1] += 1;
+        }
+    }
+    for g in 0..groups {
+        off[g + 1] += off[g];
+    }
+    let total = off[groups] as usize;
+    out.clear();
+    out.reserve(total);
+    let slots = &mut out.spare_capacity_mut()[..total];
+    // Use off[g] as group g's write cursor; afterwards off[g] == old off[g+1].
+    for (item, &d) in items.iter().zip(dense) {
+        if d != NO_PERSON {
+            let at = &mut off[d as usize];
+            slots[*at as usize].write(*item);
+            *at += 1;
+        }
+    }
+    // Shift the cursors back into start offsets.
+    for g in (1..=groups).rev() {
+        off[g] = off[g - 1];
+    }
+    off[0] = 0;
+    // SAFETY: the start offsets partition 0..total and each group's cursor
+    // wrote exactly its count, so all `total` slots were written.
+    unsafe { out.set_len(total) };
+}
+
+/// Insertion sort by key: fastest for the short per-person slices.
+#[inline]
+fn insertion_sort_by_key<T: Copy, K: Ord>(slice: &mut [T], key: impl Fn(&T) -> K) {
+    for i in 1..slice.len() {
+        let item = slice[i];
+        let k = key(&item);
+        let mut j = i;
+        while j > 0 && key(&slice[j - 1]) > k {
+            slice[j] = slice[j - 1];
+            j -= 1;
+        }
+        slice[j] = item;
+    }
+}
+
 /// Reusable per-worker buffers for the person stage.
 struct Scratch {
     evs: Vec<Ev>,
@@ -810,8 +1082,16 @@ struct Scratch {
     open: Vec<(i64, i64)>,
     touched: Vec<u32>,
     name_bytes: Vec<u8>,
+    /// Person grouping (see process_partition): dense ids, per-record ids,
+    /// and the grouped copies with their offset tables.
+    index: DenseIndex,
+    dense: Vec<u32>,
+    evs_by: Vec<Ev>,
+    ev_off: Vec<u32>,
+    cks_by: Vec<Ck>,
+    ck_off: Vec<u32>,
     /// Summed seconds in gather / sort / walk (reported under FAST_TIMING).
-    phase: [f64; 3],
+    phase: [f64; 5],
 }
 
 impl Scratch {
@@ -825,7 +1105,13 @@ impl Scratch {
             open: vec![(i64::MIN, i64::MIN); real_campaign_count as usize],
             touched: Vec::new(),
             name_bytes: Vec::new(),
-            phase: [0.0; 3],
+            index: DenseIndex::default(),
+            dense: Vec::new(),
+            evs_by: Vec::new(),
+            ev_off: Vec::new(),
+            cks_by: Vec::new(),
+            ck_off: Vec::new(),
+            phase: [0.0; 5],
         }
     }
 }
@@ -868,23 +1154,53 @@ fn process_partition<'a>(
         scratch.cks.extend_from_slice(&chunk.cks[lo..hi]);
     }
     let t_gathered = Instant::now();
-    // Events by (person, ts). Raw u64 person order is only used to group (any
-    // consistent order works); order among equal-ts events cannot affect any
-    // output (they share a session, and all aggregates are sums).
-    scratch
-        .evs
-        .sort_unstable_by_key(|e| (u128::from(e.person) << 32) | u128::from(e.ts_rel));
-    // Clicks by (person, ts, click_id bytes): within an equal-ts run the first
-    // click has the byte-wise smallest click_id (rules Clicks 4 tie-break).
-    sort_clicks(&mut scratch.cks, ids, pc.any_fallback_click);
+    // Group by person without a comparison sort over the whole partition:
+    // give each person with events a dense id (first-seen order) through a
+    // small L1/L2-resident hash table, counting-sort events and clicks by that
+    // id, then sort each person's short slice by time. Clicks of persons with
+    // no events get no id and are dropped: they can credit or assist nothing.
+    let t_grouped = {
+        let Scratch { evs, cks, index, dense, evs_by, ev_off, cks_by, ck_off, .. } = &mut *scratch;
+        index.reset(evs.len() / 16 + 8);
+        dense.clear();
+        dense.extend(evs.iter().map(|e| index.insert(e.person)));
+        let groups = index.persons.len();
+        group_by_dense(evs, dense, groups, evs_by, ev_off);
+        dense.clear();
+        dense.extend(cks.iter().map(|c| index.get(c.person)));
+        group_by_dense(cks, dense, groups, cks_by, ck_off);
+        let t_grouped = Instant::now();
+        for d in 0..groups {
+            // Events by ts. Order among equal-ts events cannot affect any
+            // output (they share a session; all aggregates are sums).
+            let slice = &mut evs_by[ev_off[d] as usize..ev_off[d + 1] as usize];
+            if slice.len() <= 24 {
+                insertion_sort_by_key(slice, |e| e.ts_rel);
+            } else {
+                slice.sort_unstable_by_key(|e| e.ts_rel);
+            }
+            // Clicks by (ts, click_id bytes): within an equal-ts run the first
+            // click has the byte-wise smallest click_id (rules Clicks 4).
+            let slice = &mut cks_by[ck_off[d] as usize..ck_off[d + 1] as usize];
+            if slice.len() > 1 {
+                sort_clicks(slice, ids, pc.any_fallback_click);
+            }
+        }
+        t_grouped
+    };
     let t_sorted = Instant::now();
+    scratch.phase[3] += (t_grouped - t_gathered).as_secs_f64();
+    scratch.phase[4] += (t_sorted - t_grouped).as_secs_f64();
     // Phase CPU-time totals for FAST_TIMING: gather, sort, walk.
     scratch.phase[0] += (t_gathered - t_start).as_secs_f64();
     scratch.phase[1] += (t_sorted - t_gathered).as_secs_f64();
 
     let Scratch {
-        evs,
-        cks,
+        index,
+        evs_by,
+        ev_off,
+        cks_by,
+        ck_off,
         sessions,
         starts,
         category_revenue,
@@ -892,29 +1208,13 @@ fn process_partition<'a>(
         touched,
         name_bytes,
         phase,
+        ..
     } = scratch;
     let phase_walk = &mut phase[2];
 
-    let mut ev_index = 0;
-    let mut ck_index = 0;
-    while ev_index < evs.len() {
-        let person = evs[ev_index].person;
-        let mut ev_end = ev_index + 1;
-        while ev_end < evs.len() && evs[ev_end].person == person {
-            ev_end += 1;
-        }
-        let events = &evs[ev_index..ev_end];
-        ev_index = ev_end;
-        // Clicks of persons without events are skipped: they can credit or
-        // assist nothing.
-        while ck_index < cks.len() && cks[ck_index].person < person {
-            ck_index += 1;
-        }
-        let ck_start = ck_index;
-        while ck_index < cks.len() && cks[ck_index].person == person {
-            ck_index += 1;
-        }
-        let person_clicks = &cks[ck_start..ck_index];
+    for (d, &person) in index.persons.iter().enumerate() {
+        let events = &evs_by[ev_off[d] as usize..ev_off[d + 1] as usize];
+        let person_clicks = &cks_by[ck_off[d] as usize..ck_off[d + 1] as usize];
 
         let person_name = String::from_utf8_lossy(key_bytes(person, ids, name_bytes)).into_owned();
 
@@ -1167,6 +1467,10 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         parts,
         k,
         fallback,
+        parse_level: std::env::var("FAST_PARSE_LEVEL")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(6),
     };
 
     // Tasks: (is_event, index), biggest chunks first so the tail is short.
@@ -1203,6 +1507,10 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     let ev_chunks: Vec<EvChunk> = ev_slots.into_iter().map(|c| c.expect("parsed")).collect();
     let ck_chunks: Vec<CkChunk> = ck_slots.into_iter().map(|c| c.expect("parsed")).collect();
     stages.mark("P parse (events+clicks)");
+    if ctx.parse_level < 6 {
+        eprintln!("v3: FAST_PARSE_LEVEL={} profiling run, stopping after P", ctx.parse_level);
+        return Ok(());
+    }
     if fallback.is_set() {
         return Ok(());
     }
@@ -1233,7 +1541,7 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     let next = AtomicUsize::new(0);
     let workers = rayon::current_num_threads().max(1);
     // Each worker drains the shared queue; it owns its rows and campaign grid.
-    type WorkerOut<'r> = (Vec<UserDailyRow<'r>>, CampaignDays, Vec<f64>, [f64; 3]);
+    type WorkerOut<'r> = (Vec<UserDailyRow<'r>>, CampaignDays, Vec<f64>, [f64; 5]);
     let worker_out: Vec<WorkerOut> = (0..workers)
         .into_par_iter()
         .with_max_len(1)
@@ -1257,7 +1565,7 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     let mut user_parts = Vec::with_capacity(worker_out.len());
     let mut campaign_days = CampaignDays::new(campaign_count, window_start, window_end);
     let mut part_times = Vec::new();
-    let mut phase = [0.0f64; 3];
+    let mut phase = [0.0f64; 5];
     for (rows, days, times, worker_phase) in worker_out {
         user_parts.push(rows);
         campaign_days = campaign_days.merge(days);
@@ -1278,10 +1586,10 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         // Summed over workers, divided by worker count: per-thread share.
         let w = workers as f64;
         eprintln!(
-            "  v3   S phases per thread: gather {:.4}s sort {:.4}s walk {:.4}s",
+            "  v3   S phases per thread: gather {:.4}s sort {:.4}s walk {:.4}s (sort = group {:.4}s + per-person {:.4}s)",
             phase[0] / w,
             phase[1] / w,
-            phase[2] / w
+            phase[2] / w, phase[3] / w, phase[4] / w
         );
     }
 
@@ -1496,6 +1804,27 @@ mod tests {
             .map(|c| (c.person, c.ts_rel, key_bytes(c.click, &ids, &mut Vec::new()).to_vec()))
             .collect();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn group_by_dense_is_stable_and_drops_unindexed() {
+        let mut index = DenseIndex::default();
+        index.reset(1);
+        let persons: Vec<IdKey> = (0..500u64).map(|i| (i % 37).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1).collect();
+        let dense: Vec<u32> = persons.iter().map(|&p| index.insert(p)).collect();
+        assert_eq!(index.persons.len(), 37);
+        assert_eq!(index.get(12345 << 4), NO_PERSON);
+        let mut ids = dense.clone();
+        ids[3] = NO_PERSON; // dropped
+        let items: Vec<u32> = (0..500).collect();
+        let (mut out, mut off) = (Vec::new(), Vec::new());
+        group_by_dense(&items, &ids, 37, &mut out, &mut off);
+        assert_eq!(out.len(), 499);
+        for g in 0..37 {
+            let slice = &out[off[g] as usize..off[g + 1] as usize];
+            assert!(slice.windows(2).all(|w| w[0] < w[1])); // stable
+            assert!(slice.iter().all(|&i| ids[i as usize] == g as u32));
+        }
     }
 
     #[test]

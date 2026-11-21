@@ -69,7 +69,7 @@ pub fn is_null(field: &[u8]) -> bool {
 /// - `"abc`, `abc"`, `a"bc` -> malformed (quote not around a whole field)
 /// - `"a"b"`                -> malformed (quote inside the value)
 #[inline]
-fn unquote<'a>(field: &'a [u8]) -> Option<&'a [u8]> {
+pub(crate) fn unquote<'a>(field: &'a [u8]) -> Option<&'a [u8]> {
     // `first()` rather than indexing: the field may be empty (a null), which is
     // fine and needs no unquoting.
     if field.first() == Some(&b'"') {
