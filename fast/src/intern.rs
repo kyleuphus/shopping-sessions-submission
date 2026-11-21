@@ -6,18 +6,18 @@
 //! the original bytes are kept only for output, where a person's name must be
 //! emitted verbatim (it can contain tabs, spaces and uppercase — see fixture L3).
 //!
-//! Correctness-first implementation: one allocation per distinct ID. This will
-//! show up in profiles at 60M events and is a known optimisation target.
+//! Borrow the original bytes from the mapped files and lookup buffers. Both
+//! directions of the lookup can share the same slice for the life of the run.
 
 use crate::hash::FastMap;
 
 #[derive(Default)]
-pub struct Interner {
-    map: FastMap<Box<[u8]>, u32>,
-    keys: Vec<Box<[u8]>>,
+pub struct Interner<'a> {
+    map: FastMap<&'a [u8], u32>,
+    keys: Vec<&'a [u8]>,
 }
 
-impl Interner {
+impl<'a> Interner<'a> {
     pub fn new() -> Self {
         Self::default()
     }
@@ -31,15 +31,12 @@ impl Interner {
 
     /// Intern `b`, returning its handle. Repeated calls with equal bytes return
     /// the same handle.
-    pub fn intern(&mut self, b: &[u8]) -> u32 {
-        if let Some(&id) = self.map.get(b) {
-            return id;
-        }
-        let id = self.keys.len() as u32;
-        let boxed: Box<[u8]> = b.to_vec().into_boxed_slice();
-        self.keys.push(boxed.clone());
-        self.map.insert(boxed, id);
-        id
+    pub fn intern(&mut self, b: &'a [u8]) -> u32 {
+        *self.map.entry(b).or_insert_with(|| {
+            let id = self.keys.len() as u32;
+            self.keys.push(b);
+            id
+        })
     }
 
     /// Look up an existing handle without interning.
@@ -48,8 +45,8 @@ impl Interner {
     }
 
     /// The bytes behind a handle.
-    pub fn bytes(&self, id: u32) -> &[u8] {
-        &self.keys[id as usize]
+    pub fn bytes(&self, id: u32) -> &'a [u8] {
+        self.keys[id as usize]
     }
 
     pub fn len(&self) -> usize {

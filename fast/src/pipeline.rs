@@ -3,10 +3,14 @@
 //!
 //! # Shape: parallel, sharded, no global hash map over events
 //!
-//! 1. **Lookups + links** (sequential, small): products, campaigns, the link
-//!    graph and its union-find. Afterwards these are read-only and shared by all
-//!    threads. Every ID that appears in `links/` gets a root (its person) and the
-//!    person's name (the byte-wise smallest ID in the component).
+//! 1. **Lookups** (sequential, small): products, campaigns, window.
+//!    **Links** (one sequential task): the link graph and its union-find. Every
+//!    ID that appears in `links/` gets a root (its person) and the person's name
+//!    (the byte-wise smallest ID in the component). Links runs *concurrently*
+//!    with step 2 (`rayon::join`): parse/validate never reads a person, the first
+//!    read is dedup routing in step 3. Links itself must stay sequential and in
+//!    file/line order -- roots decide shards and row order (see `build_people`).
+//!    Afterwards both are read-only and shared by all threads.
 //! 2. **Event parse** (parallel over newline-aligned chunks of every file): each
 //!    line is split, parsed and *validated* on the spot, and a record goes into
 //!    one of `SHARDS` buckets chosen by the hash of its `event_id`. Validating
@@ -14,11 +18,10 @@
 //!    copy, and step 3 only ever *uses* the validity of the kept copy, so the
 //!    rules.md order "dedup, then validate the kept copy" is preserved exactly
 //!    (fixture E5: an invalid kept copy is not rescued by a valid later one).
-//! 3. **Dedup** (parallel over event_id shards): sort the shard by
-//!    `(hash, ingest_ts)`, and within each run of equal hashes keep the first copy
-//!    of each distinct `event_id` **compared byte by byte** (a hash collision must
-//!    never merge two events). Kept copies that are valid are routed to a
-//!    *person* shard.
+//! 3. **Dedup** (parallel over event_id shards): probe an open-addressing
+//!    table, comparing full event IDs on hash matches and keeping the earliest
+//!    ingest copy. Mark the winners, then emit valid winners in record order
+//!    to their *person* shards.
 //! 4. **Clicks** (parallel over chunks): parsed, validated and routed to the same
 //!    person shards. No dedup is needed (see below).
 //! 5. **Per person shard** (parallel): sort events by (person, ts), sessionize,
@@ -183,19 +186,94 @@ fn for_each_line<'a>(chunk: &Chunk<'a>, mut f: impl FnMut(&'a [u8])) {
     }
 }
 
-/// One parsed copy of an event, already validated. `valid == false` copies are
-/// kept through dedup because an invalid *kept* copy must still kill the event.
+/// A nonempty, already unquoted ID or user field in its source chunk.
 #[derive(Clone, Copy)]
-struct ERec<'a> {
+struct EventField(u32);
+
+impl EventField {
+    const OFFSET_BITS: u32 = 24;
+    const COMPACT_CHUNK_BYTES: usize = 1 << Self::OFFSET_BITS;
+    const OFFSET_MASK: u32 = (1 << Self::OFFSET_BITS) - 1;
+
+    #[inline]
+    fn new(bytes: &[u8], field: &[u8]) -> Self {
+        // split_fields returns a subslice of the line, itself a subslice of bytes.
+        // The parse-loop assertion bounds the offset before this conversion.
+        let offset = (field.as_ptr() as usize - bytes.as_ptr() as usize) as u32;
+        let len = if bytes.len() <= Self::COMPACT_CHUNK_BYTES && field.len() <= u8::MAX as usize {
+            (field.len() as u32) << Self::OFFSET_BITS
+        } else {
+            0
+        };
+        Self(offset | len)
+    }
+
+    #[inline]
+    fn bytes(self, chunk: &[u8]) -> &[u8] {
+        let offset = if chunk.len() <= Self::COMPACT_CHUNK_BYTES {
+            let len = (self.0 >> Self::OFFSET_BITS) as usize;
+            let offset = (self.0 & Self::OFFSET_MASK) as usize;
+            if len != 0 {
+                return &chunk[offset..offset + len];
+            }
+            offset
+        } else {
+            self.0 as usize
+        };
+        // A long field (or large chunk) stores only the offset. Both fields
+        // precede a comma, and neither can contain a comma or quote. Starting
+        // after any opening quote, strip the closing quote if present.
+        let rest = &chunk[offset..];
+        let end = memchr::memchr(b',', rest).expect("parsed event field has a delimiter");
+        let field = &rest[..end];
+        field.strip_suffix(b"\"").unwrap_or(field)
+    }
+}
+
+/// One parsed copy of an event. Invalid copies stay through dedup so that an
+/// invalid winner still drops the event.
+#[derive(Clone, Copy)]
+struct ERec {
     h: u64,
     ingest: i64,
-    id: &'a [u8],
-    user: &'a [u8],
     ts: i64,
-    price: u32,
+    id: EventField,
+    user: EventField,
     category: u32,
-    etype: u8,
-    valid: bool,
+    // Events rule 3 caps purchase prices at 10,000,000 (< 2^24).
+    // Other types use price zero, leaving the upper byte for the event type.
+    price_and_type: u32,
+}
+
+impl ERec {
+    const INVALID: u32 = u32::MAX;
+
+    fn valid(&self) -> bool {
+        self.price_and_type != Self::INVALID
+    }
+
+    fn price(&self) -> u32 {
+        self.price_and_type & 0x00FF_FFFF
+    }
+
+    fn etype(&self) -> u8 {
+        (self.price_and_type >> 24) as u8
+    }
+}
+
+const _: () = assert!(std::mem::size_of::<ERec>() <= 40);
+
+#[cfg(test)]
+#[test]
+fn event_field_preserves_long_quoted_id() {
+    let id = vec![b'x'; 300];
+    let mut line = vec![b'"'];
+    line.extend(&id);
+    line.extend(b"\",user,ts,ingest,view,product,");
+    let mut fields = Vec::new();
+    assert!(split_fields(&line, 7, &mut fields));
+    assert_eq!(EventField::new(&line, fields[0]).bytes(&line), id);
+    assert_eq!(EventField::new(&line, fields[1]).bytes(&line), b"user");
 }
 
 /// A surviving (deduped, valid, not late) event on its way to a person shard.
@@ -264,23 +342,40 @@ impl Stages {
         }
         self.last = std::time::Instant::now();
     }
+
+    /// Print a duration measured elsewhere (e.g. on another thread) without
+    /// resetting the stage clock.
+    fn note(&self, label: &str, d: std::time::Duration) {
+        if self.enabled {
+            eprintln!("  {label:<28} {:>8.3}s", d.as_secs_f64());
+        }
+    }
 }
 
-/// Read-only context shared by every parallel stage.
-struct Ctx<'a> {
+/// Read-only lookups for parsing and validating events and clicks: the window,
+/// products and campaigns. Built before any parallel stage; needs nothing from
+/// `links/`.
+struct Lookups<'a> {
     window_start: i64,
     window_end: i64,
     product_category: FastMap<&'a [u8], u32>,
     unknown_category: u32,
-    campaigns: Interner,
+    campaigns: Interner<'a>,
     real_campaign_count: u32,
-    /// Every ID that appears in a kept links line -> its handle in `link_users`.
-    link_users: Interner,
-    /// Handle -> union-find root (its person).
-    roots: Vec<u32>,
 }
 
-impl<'a> Ctx<'a> {
+/// The resolved link graph: who belongs to which person, and each linked
+/// person's name. Read-only once built.
+struct People<'a> {
+    /// Every ID that appears in a kept links line -> its handle in `link_users`.
+    link_users: Interner<'a>,
+    /// Handle -> union-find root (its person).
+    roots: Vec<u32>,
+    /// Root -> handle of the byte-wise smallest ID in that person's component.
+    root_name: Vec<u32>,
+}
+
+impl People<'_> {
     /// Which person a user ID belongs to, and which person shard that is.
     #[inline]
     fn person(&self, user: &[u8]) -> (u32, usize) {
@@ -292,7 +387,124 @@ impl<'a> Ctx<'a> {
             None => (NO_ROOT, shard_of(hash_bytes(user))),
         }
     }
+}
 
+/// Resolve `links/` into persons. Returns the time it took, for FAST_TIMING
+/// (it runs concurrently with event parse, so the stage clock can't see it).
+///
+/// MUST stay sequential, in this exact order (files sorted by `csv_files`, lines
+/// in file order): handles are assigned in first-seen order, union-find roots
+/// depend on those handles, and the root picks the person shard
+/// (`fmix64(root ^ 0x5555)`) and the row order inside it. Any reordering -- e.g.
+/// interning in parallel -- changes which part file a user_daily row lands in,
+/// and breaks byte-identity of the output.
+fn build_people(link_maps: &[Mmap]) -> (People<'_>, std::time::Duration) {
+    let started = std::time::Instant::now();
+    let mut fields: Vec<&[u8]> = Vec::with_capacity(8);
+
+    // rules.md: "Links come before everything else: an event or click is the
+    // person's as soon as it is parsed, whatever its own ID." Logically, yes; in
+    // this program nothing reads a person before dedup routing, so links can be
+    // built concurrently with event parse (see `run`).
+    let mut link_users = Interner::new();
+    let mut uf = UnionFind::new(0);
+    for map in link_maps {
+        for line in data_lines(map) {
+            if !split_fields(line, 2, &mut fields) {
+                continue;
+            }
+            // Links-specific rule: a line with either field empty is dropped.
+            if fields[0].is_empty() || fields[1].is_empty() {
+                continue;
+            }
+            let a = link_users.intern(fields[0]);
+            let b = link_users.intern(fields[1]);
+            uf.grow_to(link_users.len());
+            uf.union(a, b);
+        }
+    }
+    let n_link = link_users.len();
+    let roots: Vec<u32> = (0..n_link as u32).map(|id| uf.find(id)).collect();
+    // Name each linked person by the byte-wise smallest of their IDs. This
+    // considers every linked ID, including ones never used in an event or click
+    // (rules.md, Linked IDs step 3; fixtures L2 and L3). An ID outside links/ is
+    // a person on its own and is named by itself, handled in the person stage.
+    let mut root_name: Vec<u32> = vec![u32::MAX; n_link];
+    for id in 0..n_link as u32 {
+        let r = roots[id as usize] as usize;
+        let current = root_name[r];
+        if current == u32::MAX || link_users.less(id, current) {
+            root_name[r] = id;
+        }
+    }
+
+    (
+        People {
+            link_users,
+            roots,
+            root_name,
+        },
+        started.elapsed(),
+    )
+}
+
+/// Events, step 1: parse + validate every copy, bucket by event_id hash.
+/// Reads only `Lookups`, so it can overlap with `build_people`.
+fn parse_events(lk: &Lookups<'_>, event_chunks: &[Chunk<'_>]) -> Vec<Vec<Vec<ERec>>> {
+    event_chunks
+        .par_iter()
+        .map(|chunk| {
+            // chunk_files targets 8 MiB but extends to the next newline or EOF.
+            // With no line-length bound its only intrinsic ceiling is file size.
+            // Enforce the 32-bit offset limit on the actual event chunk.
+            assert!(
+                chunk.bytes.len() <= u32::MAX as usize,
+                "event chunk exceeds u32 offset limit"
+            );
+            let mut buckets: Vec<Vec<ERec>> = empty_buckets();
+            let mut fields: Vec<&[u8]> = Vec::with_capacity(8);
+            for_each_line(chunk, |line| {
+                if !split_fields(line, 7, &mut fields) {
+                    return;
+                }
+                let id = fields[0];
+                if id.is_empty() {
+                    return;
+                }
+                // rules.md: ingest_ts is always valid F1.
+                let Some(ingest) = ts::parse_ts(fields[3]) else {
+                    return;
+                };
+                let h = hash_bytes(id);
+                let id = EventField::new(chunk.bytes, id);
+                let rec = match lk.validate_event(&fields, ingest) {
+                    Some((ts, etype, category, price)) => ERec {
+                        h,
+                        ingest,
+                        id,
+                        user: EventField::new(chunk.bytes, fields[1]),
+                        ts,
+                        category,
+                        price_and_type: price | (u32::from(etype) << 24),
+                    },
+                    None => ERec {
+                        h,
+                        ingest,
+                        id,
+                        user: EventField(0), // Never read for an invalid winner.
+                        ts: 0,
+                        category: 0,
+                        price_and_type: ERec::INVALID,
+                    },
+                };
+                buckets[shard_of(h)].push(rec);
+            });
+            buckets
+        })
+        .collect()
+}
+
+impl<'a> Lookups<'a> {
     /// Validate one event copy (rules.md Events steps 3 and 4). Returns
     /// `(ts, etype, category, price)` when the copy would survive.
     #[inline]
@@ -316,21 +528,21 @@ impl<'a> Ctx<'a> {
         if ingest - event_ts > LATE_CUTOFF_MS {
             return None;
         }
-        // price_cents matters only for purchases; for view/cart it is ignored
-        // whatever it holds (fixture E10).
-        let mut price = 0u32;
-        if etype == TYPE_PURCHASE {
-            match parse_digits(price_field) {
-                Some(value) if (1..=10_000_000).contains(&value) => price = value as u32,
-                _ => return None,
-            }
+        // Views and carts still require a product ID, checked above. Only
+        // purchases contribute price or category to the daily aggregates.
+        if etype != TYPE_PURCHASE {
+            return Some((event_ts, etype, self.unknown_category, 0));
+        }
+        let price = parse_digits(price_field)?;
+        if !(1..=10_000_000).contains(&price) {
+            return None;
         }
         let category = self
             .product_category
             .get(product)
             .copied()
             .unwrap_or(self.unknown_category);
-        Some((event_ts, etype, category, price))
+        Some((event_ts, etype, category, price as u32))
     }
 }
 
@@ -390,7 +602,7 @@ fn add_assists(
 #[inline]
 fn person_name<'a>(
     pid: u64,
-    link_users: &'a Interner,
+    link_users: &Interner<'a>,
     root_name: &[u32],
     local_names: &[&'a [u8]],
 ) -> &'a [u8] {
@@ -403,7 +615,7 @@ fn person_name<'a>(
 
 /// `top_category`: highest summed purchase price_cents wins; a tie goes to the
 /// byte-wise smallest category name; null when there were no purchases.
-fn top_category<'c>(cat_rev: &[(u32, i64)], categories: &'c Interner) -> Option<Cow<'c, str>> {
+fn top_category<'c>(cat_rev: &[(u32, i64)], categories: &Interner<'c>) -> Option<Cow<'c, str>> {
     let mut top: Option<(u32, i64)> = None;
     for &(c, r) in cat_rev {
         top = match top {
@@ -500,108 +712,43 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
 
     stages.mark("lookups + mmap");
 
-    // ---- Links first. rules.md: "Links come before everything else: an event or
-    // click is the person's as soon as it is parsed, whatever its own ID."
-    let mut link_users = Interner::new();
-    let mut uf = UnionFind::new(0);
-    for map in &link_maps {
-        for line in data_lines(map) {
-            if !split_fields(line, 2, &mut fields) {
-                continue;
-            }
-            // Links-specific rule: a line with either field empty is dropped.
-            if fields[0].is_empty() || fields[1].is_empty() {
-                continue;
-            }
-            let a = link_users.intern(fields[0]);
-            let b = link_users.intern(fields[1]);
-            uf.grow_to(link_users.len());
-            uf.union(a, b);
-        }
-    }
-    let n_link = link_users.len();
-    let roots: Vec<u32> = (0..n_link as u32).map(|id| uf.find(id)).collect();
-    // Name each linked person by the byte-wise smallest of their IDs. This
-    // considers every linked ID, including ones never used in an event or click
-    // (rules.md, Linked IDs step 3; fixtures L2 and L3). An ID outside links/ is
-    // a person on its own and is named by itself, handled in the person stage.
-    let mut root_name: Vec<u32> = vec![u32::MAX; n_link];
-    for id in 0..n_link as u32 {
-        let r = roots[id as usize] as usize;
-        let current = root_name[r];
-        if current == u32::MAX || link_users.less(id, current) {
-            root_name[r] = id;
-        }
-    }
-
-    stages.mark("links + union-find");
-
-    let ctx = Ctx {
+    let lk = Lookups {
         window_start,
         window_end,
         product_category,
         unknown_category,
         campaigns,
         real_campaign_count,
-        link_users,
-        roots,
     };
 
-    // ---- Events, step 1: parse + validate every copy, bucket by event_id hash.
+    // ---- Links ‖ event parse, run concurrently.
+    // Safe because event parse/validate reads only `lk`: the first read of a
+    // person is `people.person()` in dedup routing, after the join. Links stays
+    // one sequential task to preserve handle order (see `build_people`). Both
+    // closures use the existing Rayon pool.
     let event_files: Vec<&[u8]> = event_maps.iter().map(|m| &m[..]).collect();
     let event_chunks = chunk_files(&event_files);
-    let parsed: Vec<Vec<Vec<ERec>>> = event_chunks
-        .par_iter()
-        .map(|chunk| {
-            let mut buckets: Vec<Vec<ERec>> = empty_buckets();
-            let mut fields: Vec<&[u8]> = Vec::with_capacity(8);
-            for_each_line(chunk, |line| {
-                if !split_fields(line, 7, &mut fields) {
-                    return;
-                }
-                let id = fields[0];
-                if id.is_empty() {
-                    return;
-                }
-                // rules.md: ingest_ts is always valid F1.
-                let Some(ingest) = ts::parse_ts(fields[3]) else {
-                    return;
-                };
-                let h = hash_bytes(id);
-                let rec = match ctx.validate_event(&fields, ingest) {
-                    Some((ts, etype, category, price)) => ERec {
-                        h,
-                        ingest,
-                        id,
-                        user: fields[1],
-                        ts,
-                        price,
-                        category,
-                        etype,
-                        valid: true,
-                    },
-                    None => ERec {
-                        h,
-                        ingest,
-                        id,
-                        user: &[],
-                        ts: 0,
-                        price: 0,
-                        category: 0,
-                        etype: 0,
-                        valid: false,
-                    },
-                };
-                buckets[shard_of(h)].push(rec);
-            });
-            buckets
-        })
-        .collect();
+    let ((people, links_time), parsed) = rayon::join(
+        || build_people(&link_maps),
+        || parse_events(&lk, &event_chunks),
+    );
 
-    stages.mark("event parse + validate");
+    stages.mark("links ‖ event parse");
+    stages.note("  (links alone)", links_time);
+
+    // Attach the source chunk to each nonempty piece during transpose. Keep
+    // the same chunk order as transpose so the winner bitset and emit order agree.
+    let mut event_pieces = empty_buckets();
+    for (chunk, buckets) in event_chunks.iter().zip(parsed) {
+        for (shard, piece) in buckets.into_iter().enumerate() {
+            if !piece.is_empty() {
+                event_pieces[shard].push((chunk.bytes, piece));
+            }
+        }
+    }
 
     // ---- Events, step 2: dedup per event_id shard, route survivors by person.
-    let deduped: Vec<Vec<Vec<PEv>>> = transpose(parsed)
+    let deduped: Vec<Vec<Vec<PEv>>> = event_pieces
         .into_par_iter()
         .map(|pieces| {
             // Open-addressing table over this shard's copies, keyed by event_id.
@@ -609,13 +756,21 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
             // distinct event_id. Two copies are the same event only if their ids
             // are byte-equal: a hash match alone is never trusted, so a 64-bit
             // collision just probes on to another slot (a different event).
-            let n: usize = pieces.iter().map(|p| p.len()).sum();
-            let cap = (n * 2).next_power_of_two().max(16);
+            let mut piece_bases = Vec::with_capacity(pieces.len());
+            let mut n = 0usize;
+            for (_, piece) in &pieces {
+                piece_bases.push(n);
+                n += piece.len();
+            }
+            // Round up from a 2/3 worst-case load. Starting at twice the
+            // copy count can double the allocation and final slot scan when
+            // the shard size sits just above half a power of two.
+            let cap = (n + n.div_ceil(2)).next_power_of_two().max(16);
             let mask = cap - 1;
             const EMPTY: u64 = u64::MAX;
             // location = piece << 32 | offset
             let mut slots: Vec<(u64, u64)> = vec![(0, EMPTY); cap];
-            for (pi, piece) in pieces.iter().enumerate() {
+            for (pi, (chunk, piece)) in pieces.iter().enumerate() {
                 for (oi, r) in piece.iter().enumerate() {
                     let loc = ((pi as u64) << 32) | oi as u64;
                     // Low bits pick the slot; the top bits already picked the shard.
@@ -627,8 +782,9 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                             break;
                         }
                         if sh == r.h {
-                            let kept = &pieces[(sloc >> 32) as usize][(sloc & 0xFFFF_FFFF) as usize];
-                            if kept.id == r.id {
+                            let (kept_chunk, kept_piece) = &pieces[(sloc >> 32) as usize];
+                            let kept = &kept_piece[sloc as u32 as usize];
+                            if kept.id.bytes(kept_chunk) == r.id.bytes(chunk) {
                                 // Same event: keep the smallest ingest_ts. Equal
                                 // ingest_ts copies are identical (rules.md), so a
                                 // tie keeps either.
@@ -642,25 +798,46 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                     }
                 }
             }
-            let mut out: Vec<Vec<PEv>> = empty_buckets();
-            for &(_, loc) in &slots {
-                if loc == EMPTY {
-                    continue;
+            // Mark final slot locations without loading the records in hash
+            // order. Then stream the pieces using one bit per input record.
+            let mut winners = vec![0u64; n.div_ceil(64)];
+            for (_, loc) in slots {
+                if loc != EMPTY {
+                    let piece = (loc >> 32) as usize;
+                    let offset = loc as u32 as usize;
+                    let index = piece_bases[piece] + offset;
+                    winners[index / 64] |= 1u64 << (index % 64);
                 }
-                let r = &pieces[(loc >> 32) as usize][(loc & 0xFFFF_FFFF) as usize];
+            }
+            let records = pieces
+                .iter()
+                .flat_map(|(chunk, piece)| piece.iter().map(move |r| (*chunk, r)));
+            let survivors = records.enumerate().filter_map(|(index, (chunk, r))| {
                 // Validity is that of the KEPT copy: an invalid kept copy drops
                 // the event, and a later valid copy does not rescue it (E5).
-                if !r.valid {
-                    continue;
-                }
-                let (root, shard) = ctx.person(r.user);
-                out[shard].push(PEv {
-                    user: r.user,
+                let won = winners[index / 64] & (1u64 << (index % 64)) != 0;
+                (won && r.valid()).then_some((chunk, r))
+            });
+            let mut counts = [0usize; SHARDS];
+            let mut routes: Vec<(u32, u32)> = Vec::with_capacity(n);
+            for (chunk, r) in survivors.clone() {
+                let user = r.user.bytes(chunk);
+                let (root, shard) = people.person(user);
+                // Shard indices fit in u32, keeping each cached route at 8 bytes.
+                routes.push((root, shard as u32));
+                counts[shard] += 1;
+            }
+            let mut out: Vec<Vec<PEv>> = counts.into_iter().map(Vec::with_capacity).collect();
+            // Both passes visit the same survivors in record order, so the
+            // cached routes line up with their records and bucket order is kept.
+            for ((chunk, r), (root, shard)) in survivors.zip(routes) {
+                out[shard as usize].push(PEv {
+                    user: r.user.bytes(chunk),
                     root,
                     ts: r.ts,
-                    price: r.price,
+                    price: r.price(),
                     category: r.category,
-                    etype: r.etype,
+                    etype: r.etype(),
                 });
             }
             out
@@ -699,13 +876,13 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                     return;
                 }
                 // Must name a campaign that is actually in campaigns.csv.
-                let Some(campaign) = ctx.campaigns.get(campaign_field) else {
+                let Some(campaign) = lk.campaigns.get(campaign_field) else {
                     return;
                 };
-                if campaign >= ctx.real_campaign_count {
+                if campaign >= lk.real_campaign_count {
                     return;
                 }
-                let (root, shard) = ctx.person(user);
+                let (root, shard) = people.person(user);
                 buckets[shard].push(PCl {
                     user,
                     root,
@@ -723,7 +900,8 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     // ---- Per person shard: sessionize, attribute, aggregate.
     let event_shards = transpose(deduped);
     let click_shards = transpose(clicks);
-    let link_users = &ctx.link_users;
+    let link_users = &people.link_users;
+    let root_name = &people.root_name;
     let shard_results: Vec<(Vec<UserDailyRow>, FastMap<(u32, i32), CampaignDay>)> = event_shards
         .into_par_iter()
         .zip(click_shards.into_par_iter())
@@ -828,7 +1006,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                     if day != cur_day {
                         if g_sessions > 0 {
                             user_rows.push(UserDailyRow {
-                                user_id: String::from_utf8_lossy(person_name(pid, link_users, &root_name, &local_names)),
+                                user_id: String::from_utf8_lossy(person_name(pid, link_users, root_name, &local_names)),
                                 day: cur_day,
                                 sessions: g_sessions,
                                 events: g_events,
@@ -874,7 +1052,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                 }
                 if g_sessions > 0 {
                     user_rows.push(UserDailyRow {
-                        user_id: String::from_utf8_lossy(person_name(pid, link_users, &root_name, &local_names)),
+                        user_id: String::from_utf8_lossy(person_name(pid, link_users, root_name, &local_names)),
                         day: cur_day,
                         sessions: g_sessions,
                         events: g_events,
@@ -975,7 +1153,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     for ((campaign, day), accumulated) in &campaign_days {
         let channel = campaign_channel[*campaign as usize];
         campaign_rows.push(CampaignDailyRow {
-            campaign_id: String::from_utf8_lossy(ctx.campaigns.bytes(*campaign)),
+            campaign_id: String::from_utf8_lossy(lk.campaigns.bytes(*campaign)),
             channel: String::from_utf8_lossy(channels.bytes(channel)),
             day: *day,
             sessions: accumulated.sessions,

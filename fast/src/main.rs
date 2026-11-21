@@ -9,6 +9,10 @@ use std::path::PathBuf;
 
 use fast::pipeline;
 
+// Use mimalloc for pipeline allocations, including those on Rayon workers.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn dir_from(env_key: &str, argv_index: usize, default: &str) -> PathBuf {
     if let Ok(value) = std::env::var(env_key) {
         return PathBuf::from(value);
