@@ -122,7 +122,218 @@ fn unquote<'a>(field: &'a [u8]) -> Option<&'a [u8]> {
 ///
 /// `out` is cleared on entry, so one buffer can be reused for every line of a
 /// multi-gigabyte scan without reallocating.
+///
+/// # Implementation: SIMD comma scan
+///
+/// The hot loop finds every comma and notes whether any `"` occurs. On x86_64
+/// with AVX2 (compile-time `target_feature`) it does that 32 bytes at a time; on
+/// aarch64 (NEON is always present) 16 bytes at a time. Each chunk yields a
+/// bitmask with one bit per comma; the bits are visited lowest-first, which is
+/// exactly left-to-right order, and each one is handled with the *same* logic
+/// as the scalar loop (same push order, same too-many-fields bail-out). The
+/// bytes left over after the last whole chunk go through the scalar loop, and
+/// so does the whole line on any other target. Quote handling (`unquote`) is
+/// shared and untouched. So the result — the bool AND the contents of `out`,
+/// even on failure — is identical to [`split_fields_scalar`], which is kept as
+/// the reference and differentially tested against this function.
 pub fn split_fields<'a>(line: &'a [u8], expected_fields: usize, out: &mut Vec<&'a [u8]>) -> bool {
+    out.clear();
+
+    if line.is_empty() || expected_fields == 0 {
+        return false;
+    }
+    let need_commas = expected_fields - 1;
+    let n = line.len();
+    let mut start = 0usize;
+    let mut saw_quote = false;
+
+    // SIMD prefix: processes whole chunks, returns the index where the scalar
+    // tail must resume, or None if the line already has too many fields.
+    let mut i = match simd_prefix(line, need_commas, out, &mut start, &mut saw_quote) {
+        Some(j) => j,
+        None => return false,
+    };
+
+    // Scalar tail (or the whole line on targets without a SIMD path). Same
+    // logic as `split_fields_scalar`.
+    while i < n {
+        let b = line[i];
+        if b == b',' {
+            if out.len() == need_commas {
+                return false;
+            }
+            out.push(&line[start..i]);
+            start = i + 1;
+        } else if b == b'"' {
+            saw_quote = true;
+        }
+        i += 1;
+    }
+
+    if out.len() != need_commas {
+        return false;
+    }
+    out.push(&line[start..n]);
+
+    if saw_quote {
+        for f in out.iter_mut() {
+            match unquote(*f) {
+                Some(v) => *f = v,
+                None => return false,
+            }
+        }
+    }
+
+    true
+}
+
+/// Dispatch to the SIMD scanner compiled for this target (exactly one of these
+/// three definitions exists). The fallback scans nothing and returns 0, leaving
+/// the whole line to the scalar loop.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+fn simd_prefix<'a>(
+    line: &'a [u8],
+    need_commas: usize,
+    out: &mut Vec<&'a [u8]>,
+    start: &mut usize,
+    saw_quote: &mut bool,
+) -> Option<usize> {
+    // SAFETY: avx2 is enabled at compile time (target_feature cfg).
+    unsafe { scan_avx2(line, need_commas, out, start, saw_quote) }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn simd_prefix<'a>(
+    line: &'a [u8],
+    need_commas: usize,
+    out: &mut Vec<&'a [u8]>,
+    start: &mut usize,
+    saw_quote: &mut bool,
+) -> Option<usize> {
+    // SAFETY: NEON is mandatory on aarch64.
+    unsafe { scan_neon(line, need_commas, out, start, saw_quote) }
+}
+
+#[cfg(not(any(
+    all(target_arch = "x86_64", target_feature = "avx2"),
+    target_arch = "aarch64"
+)))]
+#[inline(always)]
+fn simd_prefix<'a>(
+    _line: &'a [u8],
+    _need_commas: usize,
+    _out: &mut Vec<&'a [u8]>,
+    _start: &mut usize,
+    _saw_quote: &mut bool,
+) -> Option<usize> {
+    Some(0)
+}
+
+/// Handle all commas of one chunk. `mask` has exactly one set bit per comma,
+/// at bit position `(byte offset within chunk) * shift_unit` — 1 for AVX2,
+/// 4 for the NEON nibble mask. Returns false on too many fields.
+#[cfg(any(all(target_arch = "x86_64", target_feature = "avx2"), target_arch = "aarch64"))]
+#[inline(always)]
+fn push_commas<'a>(
+    line: &'a [u8],
+    base: usize,
+    mut mask: u64,
+    shift: u32,
+    need_commas: usize,
+    out: &mut Vec<&'a [u8]>,
+    start: &mut usize,
+) -> bool {
+    while mask != 0 {
+        let pos = base + (mask.trailing_zeros() >> shift) as usize;
+        mask &= mask - 1; // clear lowest set bit
+        if out.len() == need_commas {
+            return false;
+        }
+        out.push(&line[*start..pos]);
+        *start = pos + 1;
+    }
+    true
+}
+
+/// AVX2: 32-byte chunks. Returns the index of the first unprocessed byte, or
+/// None when the line has more than `need_commas` commas.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+#[inline(always)]
+unsafe fn scan_avx2<'a>(
+    line: &'a [u8],
+    need_commas: usize,
+    out: &mut Vec<&'a [u8]>,
+    start: &mut usize,
+    saw_quote: &mut bool,
+) -> Option<usize> {
+    use std::arch::x86_64::*;
+    let n = line.len();
+    let ptr = line.as_ptr();
+    let v_comma = _mm256_set1_epi8(b',' as i8);
+    let v_quote = _mm256_set1_epi8(b'"' as i8);
+    // OR of all quote-compare results; tested once after the loop.
+    let mut qacc = _mm256_setzero_si256();
+    let mut i = 0usize;
+    while i + 32 <= n {
+        // In bounds: i + 32 <= n. Unaligned load.
+        let chunk = _mm256_loadu_si256(ptr.add(i) as *const __m256i);
+        let cmask = _mm256_movemask_epi8(_mm256_cmpeq_epi8(chunk, v_comma)) as u32;
+        qacc = _mm256_or_si256(qacc, _mm256_cmpeq_epi8(chunk, v_quote));
+        if !push_commas(line, i, cmask as u64, 0, need_commas, out, start) {
+            return None;
+        }
+        i += 32;
+    }
+    if _mm256_testz_si256(qacc, qacc) == 0 {
+        *saw_quote = true;
+    }
+    Some(i)
+}
+
+/// NEON: 16-byte chunks. `vceqq_u8` gives 0xFF/0x00 per byte; narrowing each
+/// u16 lane right-shifted by 4 (`shrn #4`) packs that into a u64 with 4 bits
+/// per input byte. Masking with 0x8888... keeps one bit per byte (bit 4k+3 for
+/// byte k), so `trailing_zeros() >> 2` is the byte offset.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn scan_neon<'a>(
+    line: &'a [u8],
+    need_commas: usize,
+    out: &mut Vec<&'a [u8]>,
+    start: &mut usize,
+    saw_quote: &mut bool,
+) -> Option<usize> {
+    use std::arch::aarch64::*;
+    let n = line.len();
+    let ptr = line.as_ptr();
+    let v_comma = vdupq_n_u8(b',');
+    let v_quote = vdupq_n_u8(b'"');
+    let mut qacc = vdupq_n_u8(0);
+    let mut i = 0usize;
+    while i + 16 <= n {
+        // In bounds: i + 16 <= n.
+        let chunk = vld1q_u8(ptr.add(i));
+        let ceq = vceqq_u8(chunk, v_comma);
+        qacc = vorrq_u8(qacc, vceqq_u8(chunk, v_quote));
+        let nib = vshrn_n_u16::<4>(vreinterpretq_u16_u8(ceq));
+        let cmask = vget_lane_u64::<0>(vreinterpret_u64_u8(nib)) & 0x8888_8888_8888_8888;
+        if !push_commas(line, i, cmask, 2, need_commas, out, start) {
+            return None;
+        }
+        i += 16;
+    }
+    if vmaxvq_u8(qacc) != 0 {
+        *saw_quote = true;
+    }
+    Some(i)
+}
+
+/// The original byte-at-a-time implementation, kept verbatim as the reference
+/// for the differential tests of [`split_fields`].
+#[cfg_attr(not(test), allow(dead_code))]
+fn split_fields_scalar<'a>(line: &'a [u8], expected_fields: usize, out: &mut Vec<&'a [u8]>) -> bool {
     out.clear();
 
     // "An empty line is malformed too." Checked before anything else, because a
@@ -218,7 +429,11 @@ mod tests {
 
     /// Convenience: `Some(fields)` when the line is well-formed, `None` when it
     /// is malformed and the caller must drop it.
+    ///
+    /// Every call is also a differential test: the SIMD `split_fields` must
+    /// agree exactly with `split_fields_scalar` on this input.
     fn split(line: &[u8], expected_fields: usize) -> Option<Vec<&[u8]>> {
+        assert_same(line, expected_fields);
         let mut out = Vec::new();
         if split_fields(line, expected_fields, &mut out) {
             Some(out)
@@ -796,5 +1011,144 @@ mod tests {
         assert_eq!(rows[2][6], b"500", "no \\r on this line");
         assert_eq!(rows[3][0], b"e3\r", "e3\\r is a different event_id from e3");
         assert_ne!(rows[3][0], rows[2][0]);
+    }
+
+    // ------------------------------------- SIMD vs scalar differential tests
+
+    /// (ptr, len) of each field, so "identical" means the very same subslice,
+    /// not merely equal bytes.
+    fn spans(v: &[&[u8]]) -> Vec<(usize, usize)> {
+        v.iter().map(|f| (f.as_ptr() as usize, f.len())).collect()
+    }
+
+    /// Assert `split_fields` and `split_fields_scalar` agree on the bool and on
+    /// the exact contents of `out` (also on failure, where the push order of
+    /// both implementations is the same).
+    fn assert_same(line: &[u8], expected_fields: usize) {
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        let ra = split_fields(line, expected_fields, &mut a);
+        let rb = split_fields_scalar(line, expected_fields, &mut b);
+        assert_eq!(ra, rb, "result differs for {:?} / {}", line, expected_fields);
+        assert_eq!(spans(&a), spans(&b), "fields differ for {:?} / {}", line, expected_fields);
+    }
+
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    #[test]
+    fn simd_matches_scalar_on_random_lines() {
+        const ALPHA: &[u8] = &[b'a', b'1', b',', b'"', b' ', b'\r', 0xC3, 0xA9];
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        let mut line = Vec::with_capacity(256);
+        let mut accepted = 0usize;
+        for iter in 0..300_000u32 {
+            line.clear();
+            let len = rng.below(200) as usize;
+            // Vary the density of special bytes so long lines are not always
+            // rejected for having too many commas.
+            let mode = rng.below(4);
+            for _ in 0..len {
+                let b = match mode {
+                    0 => ALPHA[rng.below(ALPHA.len() as u64) as usize],
+                    1 => {
+                        if rng.below(16) == 0 { b',' } else { b'a' }
+                    }
+                    2 => {
+                        let r = rng.below(32);
+                        if r == 0 { b',' } else if r == 1 { b'"' } else { ALPHA[(r % 8) as usize] }
+                    }
+                    _ => [b'a', b'1', b' ', b'\r', 0xC3, 0xA9][rng.below(6) as usize],
+                };
+                line.push(b);
+            }
+            // Mode 3 lines are comma/quote free; place commas exactly on and
+            // around 16/32-byte chunk boundaries.
+            if mode == 3 && len > 0 {
+                for &p in &[15usize, 16, 31, 32, 33, 47, 48, 63, 64, 95, 96, 127, 128] {
+                    if p < len && rng.below(2) == 0 {
+                        line[p] = b',';
+                    }
+                }
+                if rng.below(4) == 0 {
+                    line[rng.below(len as u64) as usize] = b'"';
+                }
+            }
+            let expected = 1 + (iter as usize % 9);
+            let mut tmp = Vec::new();
+            if split_fields_scalar(&line, expected, &mut tmp) {
+                accepted += 1;
+            }
+            assert_same(&line, expected);
+            // Also try the field count the line actually has, so the success
+            // path is exercised heavily.
+            let commas = line.iter().filter(|&&b| b == b',').count();
+            assert_same(&line, commas + 1);
+        }
+        assert!(accepted > 1000, "fuzz should hit the success path ({accepted})");
+    }
+
+    #[test]
+    fn simd_matches_scalar_on_chunk_boundaries_exhaustively() {
+        // Every line of length 1..=100 with a single comma at every position,
+        // two commas at every pair of positions straddling 16/32 boundaries,
+        // and quoted/unquoted variants.
+        for len in 1..=100usize {
+            for p in 0..len {
+                let mut l = vec![b'x'; len];
+                l[p] = b',';
+                for e in 1..=3 {
+                    assert_same(&l, e);
+                }
+                for q in 0..len {
+                    let mut m = l.clone();
+                    if q != p {
+                        m[q] = b'"';
+                    }
+                    assert_same(&m, 2);
+                }
+            }
+        }
+        // Wrapped fields crossing chunk boundaries.
+        for w in 0..80usize {
+            let mut l = Vec::new();
+            l.push(b'"');
+            l.extend(std::iter::repeat(b'a').take(w));
+            l.extend_from_slice(b"\",\"");
+            l.extend(std::iter::repeat(b'b').take(w / 2));
+            l.push(b'"');
+            assert_same(&l, 2);
+            let f = split(&l, 2).expect("two wrapped fields");
+            assert_eq!(f[0].len(), w);
+        }
+    }
+
+    #[test]
+    fn simd_matches_scalar_on_long_realistic_lines() {
+        let lines: [&[u8]; 6] = [
+            b"e2,u1,2026-10-03T10:05:00Z,2026-10-03T12:00:00Z,purchase,p1,1000",
+            b"\"e2\",\"u1\",\"2026-10-03T10:05:00Z\",\"2026-10-03T12:00:00Z\",\"purchase\",\"p1\",\"1000\"",
+            b"e2,u1,2026-10-03T10:05:00Z,2026-10-03T12:00:00Z,purchase,p1,1000\r",
+            b"e2,u1,2026-10-03T10:05:00Z,2026-10-03T12:00:00Z,purchase,p1,10\"00",
+            b"e2,u1,2026-10-03T10:05:00Z,2026-10-03T12:00:00Z,purchase,p1,1000,",
+            b"e2,u1,2026-10-03T10:05:00Z,2026-10-03T12:00:00Z,purchase,p1",
+        ];
+        for l in lines {
+            for e in 1..=9 {
+                assert_same(l, e);
+            }
+        }
     }
 }

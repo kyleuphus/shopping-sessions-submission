@@ -1,4 +1,6 @@
-# Keep the build context small. The graders' build only needs fast/.
+# Keep the build context small. The graders' build only needs fast/ and the
+# generator's source (Cargo.toml, Cargo.lock, src/), which the Dockerfile uses to
+# make PGO training data. generator/target/ is excluded by **/target/ below.
 # Without this, the context includes ~4 MB of dev-answer plus three copies of
 # the 36 fixtures, none of which the image uses.
 
@@ -22,7 +24,6 @@ dev-answer/
 starter-duckdb/
 starter-polars/
 starter-pyspark/
-generator/
 
 # Docs
 *.md

@@ -32,5 +32,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     pipeline::run(&data, &output)?;
 
     eprintln!("done in {:.3}s", started.elapsed().as_secs_f64());
-    Ok(())
+    // Exit straight away rather than returning: the OS reclaims everything, so
+    // skip any remaining destructors. Output files are already closed and
+    // flushed (see the end of pipeline::run). Errors above still return Err,
+    // which exits nonzero.
+    std::process::exit(0)
 }

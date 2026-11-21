@@ -322,6 +322,118 @@ struct CampaignDay {
     assisted_sessions: i64,
 }
 
+impl CampaignDay {
+    #[inline]
+    fn add(&mut self, o: &CampaignDay) {
+        self.sessions += o.sessions;
+        self.purchasing_sessions += o.purchasing_sessions;
+        self.revenue += o.revenue;
+        self.assisted_sessions += o.assisted_sessions;
+    }
+
+    /// A cell becomes a `campaign_daily` row iff at least one session was
+    /// credited to it or assisted by it. The old map only ever created an entry
+    /// on `sessions += 1` or `assisted_sessions += n` with n > 0, so this is
+    /// exactly the old row set.
+    #[inline]
+    fn is_row(&self) -> bool {
+        self.sessions > 0 || self.assisted_sessions > 0
+    }
+}
+
+/// Dense cells beyond this fall back to the map. rules.md does not bound the
+/// window length; the generator uses 14 days, so 2,001 campaigns x 15 days is
+/// ~30K cells (~1 MB per accumulator).
+const MAX_DENSE_CELLS: usize = 8 << 20;
+
+/// `(campaign, day)` accumulator for `campaign_daily`. Session start days are
+/// UTC days of event timestamps in `[window_start, window_end)`, so they lie in
+/// `[min_day, min_day + n_days)` and a flat array indexed
+/// `campaign * n_days + (day - min_day)` covers every key. `Map` is the exact
+/// fallback for an absurdly long window.
+enum CampaignDays {
+    Dense {
+        cells: Vec<CampaignDay>,
+        min_day: i32,
+        n_days: usize,
+    },
+    Map(FastMap<(u32, i32), CampaignDay>),
+}
+
+impl CampaignDays {
+    /// `n_campaigns` must cover every campaign handle, `organic` included.
+    fn new(n_campaigns: usize, window_start: i64, window_end: i64) -> Self {
+        if window_end <= window_start {
+            // No event can be in the window: nothing is ever added.
+            return CampaignDays::Map(FastMap::default());
+        }
+        let min_day = window_start.div_euclid(MS_PER_DAY);
+        let max_day = (window_end - 1).div_euclid(MS_PER_DAY);
+        let n_days = (max_day - min_day + 1) as usize;
+        match n_days.checked_mul(n_campaigns) {
+            Some(n) if n <= MAX_DENSE_CELLS && i32::try_from(min_day).is_ok() => CampaignDays::Dense {
+                cells: vec![CampaignDay::default(); n],
+                min_day: min_day as i32,
+                n_days,
+            },
+            _ => CampaignDays::Map(FastMap::default()),
+        }
+    }
+
+    #[inline]
+    fn at(&mut self, campaign: u32, day: i32) -> &mut CampaignDay {
+        match self {
+            CampaignDays::Dense { cells, min_day, n_days } => {
+                // A day outside the window would be an upstream bug; fail loudly
+                // rather than land in a neighbouring campaign's cell.
+                let d = day.wrapping_sub(*min_day) as u32 as usize;
+                assert!(d < *n_days, "session day outside the window");
+                &mut cells[campaign as usize * *n_days + d]
+            }
+            CampaignDays::Map(m) => m.entry((campaign, day)).or_default(),
+        }
+    }
+
+    /// Sum `other` into `self`. Both come from `new` with the same arguments,
+    /// so they are the same variant and shape.
+    fn merge(mut self, other: CampaignDays) -> CampaignDays {
+        match (&mut self, other) {
+            (CampaignDays::Dense { cells: a, .. }, CampaignDays::Dense { cells: b, .. }) => {
+                for (x, y) in a.iter_mut().zip(&b) {
+                    x.add(y);
+                }
+            }
+            (CampaignDays::Map(a), CampaignDays::Map(b)) => {
+                for (key, d) in b {
+                    a.entry(key).or_default().add(&d);
+                }
+            }
+            _ => unreachable!("CampaignDays variants differ"),
+        }
+        self
+    }
+
+    /// Every `(campaign, day)` that becomes a row, with its sums.
+    fn for_each_row(&self, mut f: impl FnMut(u32, i32, &CampaignDay)) {
+        match self {
+            CampaignDays::Dense { cells, min_day, n_days } => {
+                for (idx, c) in cells.iter().enumerate() {
+                    if c.is_row() {
+                        f((idx / n_days) as u32, *min_day + (idx % n_days) as i32, c);
+                    }
+                }
+            }
+            CampaignDays::Map(m) => {
+                for (&(campaign, day), c) in m {
+                    if c.is_row() {
+                        f(campaign, day, c);
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Stage timing, enabled with `FAST_TIMING=1`.
 struct Stages {
     enabled: bool,
@@ -580,7 +692,7 @@ fn add_assists(
     a: i64,
     b: i64,
     campaign: u32,
-    campaign_days: &mut FastMap<(u32, i32), CampaignDay>,
+    campaign_days: &mut CampaignDays,
 ) {
     let mut lo = starts.partition_point(|&s| s < a);
     let hi = starts.partition_point(|&s| s <= b);
@@ -588,10 +700,7 @@ fn add_assists(
         let day = starts[lo].div_euclid(MS_PER_DAY);
         let day_end = (day + 1) * MS_PER_DAY; // first ms of the next day
         let next = lo + starts[lo..hi].partition_point(|&s| s < day_end);
-        campaign_days
-            .entry((campaign, day as i32))
-            .or_default()
-            .assisted_sessions += (next - lo) as i64;
+        campaign_days.at(campaign, day as i32).assisted_sessions += (next - lo) as i64;
         lo = next;
     }
 }
@@ -632,24 +741,44 @@ fn top_category<'c>(cat_rev: &[(u32, i64)], categories: &Interner<'c>) -> Option
     top.map(|(c, _)| String::from_utf8_lossy(categories.bytes(c)))
 }
 
-/// Shard-local person id: a linked person is its root (< 2^32); an unlinked user
-/// ID gets 2^32 + a local index, interned by its exact bytes.
+/// Dense shard-local person id: `0..pids.len()`, handed out in first-seen order,
+/// so the person stage can group records with a counting sort instead of a
+/// comparison sort.
+///
+/// `pids[dense]` keeps the person's identity in the encoding `person_name`
+/// reads: a linked person is its root (< 2^32); an unlinked user ID is
+/// 2^32 + its index in `names`, interned by its exact bytes.
+///
+/// Linked persons are looked up in `root_dense`, one slot per root shared by
+/// every shard. That is race-free: a root always routes to the same shard
+/// (`People::person` hashes the root), so each slot is only ever touched by the
+/// one thread running that shard; Relaxed atomics just make the sharing legal.
 #[inline]
 fn local_pid<'d>(
     local: &mut FastMap<&'d [u8], u32>,
+    root_dense: &[std::sync::atomic::AtomicU32],
+    pids: &mut Vec<u64>,
     names: &mut Vec<&'d [u8]>,
     user: &'d [u8],
     root: u32,
-) -> u64 {
+) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let next = pids.len() as u32;
     if root != NO_ROOT {
-        return root as u64;
+        let slot = &root_dense[root as usize];
+        let d = slot.load(Relaxed);
+        if d != u32::MAX {
+            return d;
+        }
+        slot.store(next, Relaxed);
+        pids.push(root as u64);
+        return next;
     }
-    let next = names.len() as u32;
-    let idx = *local.entry(user).or_insert_with(|| {
+    *local.entry(user).or_insert_with(|| {
+        pids.push((1u64 << 32) | names.len() as u64);
         names.push(user);
         next
-    });
-    (1u64 << 32) | idx as u64
+    })
 }
 
 pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
@@ -661,6 +790,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
         ts::parse_ts(manifest.window_start.as_bytes()).ok_or("manifest: bad window_start")?;
     let window_end =
         ts::parse_ts(manifest.window_end.as_bytes()).ok_or("manifest: bad window_end")?;
+    ts::set_window_hint(window_start, window_end);
 
     // ---- Map all input files up front.
     let link_maps = map_all(&csv_files(&data.join("links")))?;
@@ -902,20 +1032,36 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     let click_shards = transpose(clicks);
     let link_users = &people.link_users;
     let root_name = &people.root_name;
-    let shard_results: Vec<(Vec<UserDailyRow>, FastMap<(u32, i32), CampaignDay>)> = event_shards
+    // Root -> dense shard-local id, shared by all shards (see `local_pid`).
+    let root_dense: Vec<std::sync::atomic::AtomicU32> = (0..root_name.len())
+        .map(|_| std::sync::atomic::AtomicU32::new(u32::MAX))
+        .collect();
+    // campaign_daily: one dense `CampaignDays` per rayon fold (roughly one per
+    // worker thread, not per shard), summed by `reduce`. That replaces the old
+    // per-shard hash maps and the sequential merge of all of them.
+    // `lk.campaigns` holds every real campaign plus `organic` (interned last);
+    // nothing is interned into it after `Lookups` is built.
+    let n_campaigns = lk.campaigns.len();
+    let new_days = || CampaignDays::new(n_campaigns, lk.window_start, lk.window_end);
+    let (mut shard_rows, campaign_days): (Vec<(usize, Vec<UserDailyRow>)>, CampaignDays) = event_shards
         .into_par_iter()
         .zip(click_shards.into_par_iter())
-        .map(|(ev_pieces, cl_pieces)| {
-            // Shard-local person ids: a linked person is its root (< 2^32); an
-            // unlinked user ID gets 2^32 + a local index, interned by its bytes.
+        .enumerate()
+        .fold(
+            || (Vec::new(), new_days()),
+            |(mut rows_acc, mut campaign_days), (shard, (ev_pieces, cl_pieces))| {
+            // Dense shard-local person ids 0..n_persons (see `local_pid`);
+            // `pids[d]` is person d's identity for `person_name`.
             let mut local: FastMap<&[u8], u32> = FastMap::default();
             let mut local_names: Vec<&[u8]> = Vec::new();
+            let mut pids: Vec<u64> = Vec::new();
             let n_ev: usize = ev_pieces.iter().map(|p| p.len()).sum();
             let mut evs: Vec<Ev> = Vec::with_capacity(n_ev);
             for piece in &ev_pieces {
                 for e in piece {
+                    let d = local_pid(&mut local, &root_dense, &mut pids, &mut local_names, e.user, e.root);
                     evs.push(Ev {
-                        pid: local_pid(&mut local, &mut local_names, e.user, e.root),
+                        pid: d as u64,
                         ts: e.ts,
                         price: e.price,
                         category: e.category,
@@ -928,8 +1074,9 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
             let mut cls: Vec<Cl> = Vec::with_capacity(n_cl);
             for piece in &cl_pieces {
                 for c in piece {
+                    let d = local_pid(&mut local, &root_dense, &mut pids, &mut local_names, c.user, c.root);
                     cls.push(Cl {
-                        pid: local_pid(&mut local, &mut local_names, c.user, c.root),
+                        pid: d as u64,
                         ts: c.ts,
                         campaign: c.campaign,
                         id: c.id,
@@ -937,59 +1084,60 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                 }
             }
             drop(cl_pieces);
-            // Assists view: (person, campaign, ts), so each campaign's clicks for a
-            // person are contiguous and time-ordered.
-            let mut assist_clicks: Vec<(u64, u32, i64)> =
-                cls.iter().map(|c| (c.pid, c.campaign, c.ts)).collect();
-            assist_clicks.sort_unstable();
+            let n_persons = pids.len();
 
-            // Sessionize: sort by (person, ts). A gap OVER 30 min starts a session.
+            // Group by person in O(N) with a counting sort on the dense id, then
+            // sort each person's (small) slice. Within a person this is the same
+            // order the old global sorts by (person, ts[, click_id]) gave; only
+            // the order persons are visited in changed, and nothing depends on
+            // that (user rows are a set, campaign_days are sums).
+            //
+            // Sessionize needs events by ts. A gap OVER 30 min starts a session.
             // The gap is measured between distinct timestamps, so events sharing a
             // ts always land in the same session whatever their order (E16).
-            evs.sort_unstable_by_key(|e| (e.pid, e.ts));
-            // Clicks by (person, ts, click_id) so the crediting click can be found
-            // by position: the FIRST entry at the max qualifying ts has the
-            // smallest click_id (fixture A5).
-            cls.sort_unstable_by(|a, b| {
-                a.pid
-                    .cmp(&b.pid)
-                    .then(a.ts.cmp(&b.ts))
-                    .then_with(|| a.id.cmp(b.id))
+            let (mut evs, ev_off) = group_by_dense_key(evs, n_persons, |e| e.pid as usize, || Ev {
+                pid: 0,
+                ts: 0,
+                price: 0,
+                category: 0,
+                etype: 0,
             });
+            // Clicks by (ts, click_id) so the crediting click can be found by
+            // position: the FIRST entry at the max qualifying ts has the
+            // smallest click_id (fixture A5).
+            let (mut cls, cl_off) = group_by_dense_key(cls, n_persons, |c| c.pid as usize, || Cl {
+                pid: 0,
+                ts: 0,
+                campaign: 0,
+                id: &[],
+            });
+            for d in 0..n_persons {
+                evs[ev_off[d]..ev_off[d + 1]].sort_unstable_by_key(|e| e.ts);
+                cls[cl_off[d]..cl_off[d + 1]]
+                    .sort_unstable_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(b.id)));
+            }
 
             let mut user_rows: Vec<UserDailyRow> = Vec::new();
-            let mut campaign_days: FastMap<(u32, i32), CampaignDay> = FastMap::default();
             let mut sess: Vec<Session> = Vec::new();
             let mut starts: Vec<i64> = Vec::new();
-            let mut ai = 0;
             let mut cat_rev: Vec<(u32, i64)> = Vec::new();
+            // Assists: per campaign, the current person's open merged interval
+            // [a, b] (a == i64::MIN: none open), plus which campaigns have one
+            // open. Clicks are validated to real campaigns, so
+            // `campaign < real_campaign_count`.
+            let mut open: Vec<(i64, i64)> =
+                vec![(i64::MIN, i64::MIN); lk.real_campaign_count as usize];
+            let mut touched: Vec<u32> = Vec::new();
 
-            let mut ci = 0;
-            let mut i = 0;
-            while i < evs.len() {
-                let pid = evs[i].pid;
-                let mut j = i + 1;
-                while j < evs.len() && evs[j].pid == pid {
-                    j += 1;
+            // A person with clicks but no events has no sessions: skipped, as
+            // before.
+            for d in 0..n_persons {
+                let (i, j) = (ev_off[d], ev_off[d + 1]);
+                if i == j {
+                    continue;
                 }
-                while ci < cls.len() && cls[ci].pid < pid {
-                    ci += 1;
-                }
-                let mut ce = ci;
-                while ce < cls.len() && cls[ce].pid == pid {
-                    ce += 1;
-                }
-                let pclicks = &cls[ci..ce];
-                ci = ce;
-                while ai < assist_clicks.len() && assist_clicks[ai].0 < pid {
-                    ai += 1;
-                }
-                let mut ae = ai;
-                while ae < assist_clicks.len() && assist_clicks[ae].0 == pid {
-                    ae += 1;
-                }
-                let passist = &assist_clicks[ai..ae];
-                ai = ae;
+                let pid = pids[d];
+                let pclicks = &cls[cl_off[d]..cl_off[d + 1]];
                 sess.clear();
 
                 // One user-day group at a time. Sessions come out in start_ts
@@ -1083,7 +1231,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                     } else {
                         organic
                     };
-                    let entry = campaign_days.entry((credited, s.day)).or_default();
+                    let entry = campaign_days.at(credited, s.day);
                     entry.sessions += 1;
                     entry.revenue += s.revenue;
                     if s.has_purchase {
@@ -1100,68 +1248,71 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                 // starts. Never sessions x clicks: whales and shared-device
                 // persons would make that quadratic. `organic` never assists: it
                 // is never a real campaign, so it never appears in a click.
-                if !passist.is_empty() {
+                //
+                // `pclicks` is in ts order, so each campaign's own clicks are
+                // visited in ts order: exactly the per-campaign sequence a sort
+                // by (campaign, ts) would give. A click inside the campaign's
+                // open interval extends it to ts + 7d; a click past its end
+                // closes it (counted now) and opens a new one; whatever is still
+                // open is counted after the walk. The same intervals as merging
+                // a (campaign, ts)-sorted list, with no extra vector or sort;
+                // add_assists only adds counts, so the order intervals are
+                // counted in does not matter.
+                if !pclicks.is_empty() {
                     starts.clear();
                     starts.extend(sess.iter().map(|s| s.start_ts));
-                    let mut x = 0;
-                    while x < passist.len() {
-                        let campaign = passist[x].1;
-                        let mut a = passist[x].2;
-                        let mut b = a + SEVEN_DAYS_MS;
-                        x += 1;
-                        loop {
-                            let more = x < passist.len() && passist[x].1 == campaign;
-                            if more && passist[x].2 <= b {
-                                b = passist[x].2 + SEVEN_DAYS_MS;
-                                x += 1;
-                                continue;
-                            }
-                            add_assists(&starts, a, b, campaign, &mut campaign_days);
-                            if !more {
-                                break;
-                            }
-                            a = passist[x].2;
-                            b = a + SEVEN_DAYS_MS;
-                            x += 1;
+                    for c in pclicks {
+                        let slot = &mut open[c.campaign as usize];
+                        if slot.0 == i64::MIN {
+                            *slot = (c.ts, c.ts + SEVEN_DAYS_MS);
+                            touched.push(c.campaign);
+                        } else if c.ts <= slot.1 {
+                            slot.1 = c.ts + SEVEN_DAYS_MS;
+                        } else {
+                            add_assists(&starts, slot.0, slot.1, c.campaign, &mut campaign_days);
+                            *slot = (c.ts, c.ts + SEVEN_DAYS_MS);
                         }
                     }
+                    for &campaign in &touched {
+                        let (a, b) = open[campaign as usize];
+                        add_assists(&starts, a, b, campaign, &mut campaign_days);
+                        open[campaign as usize] = (i64::MIN, i64::MIN);
+                    }
+                    touched.clear();
                 }
-                i = j;
             }
-            (user_rows, campaign_days)
+            rows_acc.push((shard, user_rows));
+            (rows_acc, campaign_days)
         })
-        .collect();
+        .reduce(
+            || (Vec::new(), new_days()),
+            |(mut ra, da), (rb, db)| {
+                ra.extend(rb);
+                (ra, da.merge(db))
+            },
+        );
 
     stages.mark("sessionize + attribution");
 
     // ---- Merge shard results. user_daily rows are disjoint across shards (a
-    // person lives in exactly one); campaign_daily needs summing.
-    let mut user_parts: Vec<Vec<UserDailyRow>> = Vec::with_capacity(SHARDS);
-    let mut campaign_days: FastMap<(u32, i32), CampaignDay> = FastMap::default();
-    for (rows, days) in shard_results {
-        user_parts.push(rows);
-        for (key, d) in days {
-            let e = campaign_days.entry(key).or_default();
-            e.sessions += d.sessions;
-            e.purchasing_sessions += d.purchasing_sessions;
-            e.revenue += d.revenue;
-            e.assisted_sessions += d.assisted_sessions;
-        }
-    }
+    // person lives in exactly one); put them back in shard order so the output
+    // parts group the same shards as before. campaign_daily is already summed.
+    shard_rows.sort_unstable_by_key(|(shard, _)| *shard);
+    let user_parts: Vec<Vec<UserDailyRow>> = shard_rows.into_iter().map(|(_, rows)| rows).collect();
 
-    let mut campaign_rows: Vec<CampaignDailyRow> = Vec::with_capacity(campaign_days.len());
-    for ((campaign, day), accumulated) in &campaign_days {
-        let channel = campaign_channel[*campaign as usize];
+    let mut campaign_rows: Vec<CampaignDailyRow> = Vec::new();
+    campaign_days.for_each_row(|campaign, day, accumulated| {
+        let channel = campaign_channel[campaign as usize];
         campaign_rows.push(CampaignDailyRow {
-            campaign_id: String::from_utf8_lossy(lk.campaigns.bytes(*campaign)),
+            campaign_id: String::from_utf8_lossy(lk.campaigns.bytes(campaign)),
             channel: String::from_utf8_lossy(channels.bytes(channel)),
-            day: *day,
+            day,
             sessions: accumulated.sessions,
             purchasing_sessions: accumulated.purchasing_sessions,
             revenue_cents: accumulated.revenue,
             assisted_sessions: accumulated.assisted_sessions,
         });
-    }
+    });
 
     // Cheap invariants straight out of rules.md. They catch whole classes of bug
     // with no diffing, so they are checked on every run.
@@ -1202,5 +1353,168 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     }
     out::write_campaign_daily(&output.join("campaign_daily"), &campaign_rows)?;
     stages.mark("write parquet");
+
+    // Skip teardown: leak the big locals instead of dropping them (freeing every
+    // row/hash map and munmapping every input file), because main() calls
+    // std::process::exit(0) right after this returns and the OS reclaims it all.
+    // Safe because every Parquet writer is already closed: out.rs write_batch
+    // calls `writer.close()?` (out.rs:85), which writes the footer and drops the
+    // File, before write_user_daily / write_campaign_daily return above.
+    // Borrowers are forgotten before what they borrow from (rows/chunks ->
+    // lookups/people -> backing byte buffers and mmaps).
+    // Anything not listed (e.g. locals added later) is simply dropped as before.
+    std::mem::forget(user_parts);
+    std::mem::forget(campaign_rows);
+    std::mem::forget(campaign_days);
+    std::mem::forget(event_chunks);
+    std::mem::forget(click_chunks);
+    std::mem::forget(event_files);
+    std::mem::forget(click_files);
+    std::mem::forget(categories);
+    std::mem::forget(channels);
+    std::mem::forget(campaign_channel);
+    std::mem::forget(lk);
+    std::mem::forget(root_dense);
+    std::mem::forget(people);
+    std::mem::forget(products_bytes);
+    std::mem::forget(campaigns_bytes);
+    std::mem::forget(link_maps);
+    std::mem::forget(event_maps);
+    std::mem::forget(click_maps);
     Ok(())
+}
+
+/// Counting sort: stably group `items` by a dense key in `0..n_keys`, in O(N).
+/// Returns the grouped items and `offsets` (length `n_keys + 1`): key `k`'s
+/// items are `grouped[offsets[k]..offsets[k + 1]]`, in their input order.
+/// `filler` only pre-initialises the output so the scatter is safe code; every
+/// slot is overwritten exactly once.
+fn group_by_dense_key<T>(
+    items: Vec<T>,
+    n_keys: usize,
+    key: impl Fn(&T) -> usize,
+    filler: impl Fn() -> T,
+) -> (Vec<T>, Vec<usize>) {
+    let mut offsets = vec![0usize; n_keys + 1];
+    for it in &items {
+        offsets[key(it) + 1] += 1;
+    }
+    for k in 0..n_keys {
+        offsets[k + 1] += offsets[k];
+    }
+    let mut write = offsets[..n_keys].to_vec();
+    let mut grouped: Vec<T> = (0..items.len()).map(|_| filler()).collect();
+    for it in items {
+        let k = key(&it);
+        grouped[write[k]] = it;
+        write[k] += 1;
+    }
+    (grouped, offsets)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group_by_dense_key;
+
+    /// xorshift64: deterministic test data with no extra dependency.
+    fn rng(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Counting sort + per-key (ts, id) sort must give exactly the old global
+    /// sort by (key, ts, id), with offsets bracketing each key.
+    #[test]
+    fn counting_sort_matches_global_sort() {
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for &(n, n_keys, ts_range) in &[
+            (0usize, 0usize, 1u64),
+            (0, 5, 1),
+            (1, 1, 1),
+            (1000, 1, 3),       // one whale, many equal ts
+            (5000, 4000, 1000), // many persons, mostly singletons
+            (20000, 300, 50),   // many duplicate (key, ts)
+        ] {
+            let items: Vec<(u64, i64, u32)> = (0..n)
+                .map(|_| {
+                    let k = rng(&mut s) % n_keys as u64;
+                    let ts = (rng(&mut s) % ts_range) as i64 - 7;
+                    let id = (rng(&mut s) % 4) as u32;
+                    (k, ts, id)
+                })
+                .collect();
+            let mut expected = items.clone();
+            expected.sort_unstable();
+
+            let (mut got, off) = group_by_dense_key(items, n_keys, |t| t.0 as usize, || (0, 0, 0));
+            assert_eq!(off.len(), n_keys + 1);
+            assert_eq!(off[0], 0);
+            assert_eq!(off[n_keys], n);
+            for k in 0..n_keys {
+                assert!(got[off[k]..off[k + 1]].iter().all(|t| t.0 == k as u64));
+                got[off[k]..off[k + 1]].sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+            }
+            assert_eq!(got, expected, "n={n} n_keys={n_keys}");
+        }
+    }
+
+    /// Dense and map `CampaignDays` give the same rows, including after merge,
+    /// and a cell with only purchasing/revenue zero but assists is still a row.
+    #[test]
+    fn campaign_days_dense_matches_map() {
+        use super::{CampaignDays, FastMap, MS_PER_DAY};
+        let (ws, we) = (20_000 * MS_PER_DAY + 5, 20_014 * MS_PER_DAY + 7);
+        let n_campaigns = 37;
+        let mut s = 0xDEAD_BEEFu64;
+        let mut parts = Vec::new();
+        for _ in 0..3 {
+            let mut dense = CampaignDays::new(n_campaigns, ws, we);
+            let mut map = CampaignDays::Map(FastMap::default());
+            assert!(matches!(dense, CampaignDays::Dense { .. }));
+            for _ in 0..2000 {
+                let c = (rng(&mut s) % n_campaigns as u64) as u32;
+                let ts = ws + (rng(&mut s) % (we - ws) as u64) as i64;
+                let day = ts.div_euclid(MS_PER_DAY) as i32;
+                let assist = rng(&mut s) % 3 == 0;
+                for acc in [&mut dense, &mut map] {
+                    let e = acc.at(c, day);
+                    if assist {
+                        e.assisted_sessions += 2;
+                    } else {
+                        e.sessions += 1;
+                        e.revenue += 7;
+                    }
+                }
+            }
+            parts.push((dense, map));
+        }
+        let (mut dense, mut map) = (CampaignDays::new(n_campaigns, ws, we), CampaignDays::Map(FastMap::default()));
+        for (d, m) in parts {
+            dense = dense.merge(d);
+            map = map.merge(m);
+        }
+        let rows = |acc: &CampaignDays| {
+            let mut v = Vec::new();
+            acc.for_each_row(|c, d, x| v.push((c, d, x.sessions, x.revenue, x.assisted_sessions)));
+            v.sort_unstable();
+            v
+        };
+        let (a, b) = (rows(&dense), rows(&map));
+        assert!(!a.is_empty());
+        assert_eq!(a, b);
+        // Empty or huge windows fall back to the map.
+        assert!(matches!(CampaignDays::new(5, 10, 10), CampaignDays::Map(_)));
+        assert!(matches!(CampaignDays::new(2001, 0, 10_000 * MS_PER_DAY), CampaignDays::Map(_)));
+    }
+
+    /// The grouping is stable: within a key, input order is kept.
+    #[test]
+    fn counting_sort_is_stable() {
+        let items = vec![(2u64, 0usize), (0, 1), (2, 2), (1, 3), (0, 4), (2, 5)];
+        let (got, off) = group_by_dense_key(items, 3, |t| t.0 as usize, || (0, 0));
+        assert_eq!(got, vec![(0, 1), (0, 4), (1, 3), (2, 0), (2, 2), (2, 5)]);
+        assert_eq!(off, vec![0, 2, 3, 6]);
+    }
 }

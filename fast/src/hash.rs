@@ -1,9 +1,12 @@
 //! A fast, non-cryptographic hash for byte-string IDs and small integer keys.
 //!
-//! `std`'s default SipHash is DoS-resistant and slow. There is no adversary here,
-//! so we use an FxHash-style word-at-a-time combine with a murmur3 `fmix64`
-//! finaliser. The finaliser matters: shards are chosen from the TOP bits of the
-//! hash, and a raw Fx combine has weak high bits on short keys.
+//! `std`'s default SipHash is DoS-resistant and slow. There is no adversary here.
+//! Byte strings go through rapidhash v3 (avalanched, so both the TOP bits used by
+//! `shard_of` and the LOW bits used for table slots are well mixed). Integer keys
+//! still use the murmur3 `fmix64` finaliser, which is faster than rapidhash on a
+//! single u64. (P1a microbench, 1M real dev event IDs, avg 9.3 bytes, arm64:
+//! old Fx+fmix64 3.48 ns/hash, rapidhash 1.52 ns/hash; chi^2/df of top-8 and
+//! low-12 bit buckets ~1.0 for both.)
 //!
 //! **Correctness never depends on this hash.** Every place that groups by a hash
 //! (event dedup, person sharding, hash maps) also compares the real bytes, so a
@@ -24,22 +27,11 @@ pub fn fmix64(mut k: u64) -> u64 {
     k
 }
 
-/// Hash a byte string. Length is mixed in so `a` and `a\0` differ.
+/// Hash a byte string. rapidhash mixes the length in, so `a` and `a\0` differ.
+/// rapidhash is portable and deterministic: arm64 and x86_64 produce the same values.
 #[inline]
 pub fn hash_bytes(b: &[u8]) -> u64 {
-    let mut h: u64 = (b.len() as u64).wrapping_mul(K);
-    let mut chunks = b.chunks_exact(8);
-    for c in &mut chunks {
-        let w = u64::from_le_bytes(c.try_into().unwrap());
-        h = (h.rotate_left(5) ^ w).wrapping_mul(K);
-    }
-    let rem = chunks.remainder();
-    if !rem.is_empty() {
-        let mut buf = [0u8; 8];
-        buf[..rem.len()].copy_from_slice(rem);
-        h = (h.rotate_left(5) ^ u64::from_le_bytes(buf)).wrapping_mul(K);
-    }
-    fmix64(h)
+    rapidhash::v3::rapidhash_v3(b)
 }
 
 /// `Hasher` adapter so the same hash backs `HashMap`s.
