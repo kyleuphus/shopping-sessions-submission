@@ -91,26 +91,6 @@ impl<'a> Interner<'a> {
         })
     }
 
-    /// Intern bytes with their precomputed hash.
-    pub fn intern_hashed(&mut self, b: &'a [u8], h: u64) -> u32 {
-        debug_assert_eq!(h, hash_bytes(b));
-        *self.map.entry(Key { h, b }).or_insert_with(|| {
-            let id = self.keys.len() as u32;
-            self.keys.push(b);
-            id
-        })
-    }
-
-    /// Extract byte storage after interning, when a separate index owns lookups.
-    pub fn into_keys(self) -> Vec<&'a [u8]> {
-        self.keys
-    }
-
-    /// Store bytes in handle order. The caller supplies the lookup index.
-    pub fn from_keys(keys: Vec<&'a [u8]>) -> Self {
-        Self { map: KeyMap::default(), keys }
-    }
-
     /// Look up an existing handle without interning.
     #[inline]
     pub fn get(&self, b: &[u8]) -> Option<u32> {

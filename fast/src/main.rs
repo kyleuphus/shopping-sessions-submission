@@ -7,7 +7,7 @@
 
 use std::path::PathBuf;
 
-use fast::pipeline;
+use fast::{pipeline, pipeline2, pipeline3};
 
 // Use mimalloc for pipeline allocations, including those on Rayon workers.
 #[global_allocator]
@@ -29,7 +29,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data = dir_from("DATA_DIR", 1, "/data");
     let output = dir_from("OUTPUT_DIR", 2, "/output");
 
-    pipeline::run(&data, &output)?;
+    let flag = |key: &str| std::env::var_os(key).as_deref() == Some(std::ffi::OsStr::new("1"));
+    // v3 is the default (and is what the Dockerfile's PGO run trains).
+    // FAST_V1=1 / FAST_V2=1 select the older pipelines for comparison. v3
+    // itself falls back to v1 when a width guard fails (pipeline3.rs).
+    if flag("FAST_V1") {
+        pipeline::run(&data, &output)?;
+    } else if flag("FAST_V2") {
+        pipeline2::run(&data, &output)?;
+    } else {
+        pipeline3::run(&data, &output)?;
+    }
 
     eprintln!("done in {:.3}s", started.elapsed().as_secs_f64());
     // Exit straight away rather than returning: the OS reclaims everything, so
