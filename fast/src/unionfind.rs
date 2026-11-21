@@ -47,6 +47,14 @@ impl UnionFind {
         x
     }
 
+    /// Representative after all joins are finished, for parallel reads.
+    pub fn root(&self, mut x: u32) -> u32 {
+        while self.parent[x as usize] != x {
+            x = self.parent[x as usize];
+        }
+        x
+    }
+
     /// Join the sets containing `a` and `b`. A self-link, or a repeat of an
     /// existing link either way round, is a no-op — which is exactly what
     /// `rules.md` requires.

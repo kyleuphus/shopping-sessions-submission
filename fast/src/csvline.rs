@@ -97,6 +97,117 @@ fn unquote<'a>(field: &'a [u8]) -> Option<&'a [u8]> {
     }
 }
 
+/// Scan newline-aligned data bytes (the header has already been skipped).
+/// The delimiter offsets determine each field exactly once. Only rows that
+/// contain quotes need the slower whole-field quote check.
+#[inline]
+pub(crate) fn for_each_record<'a, const N: usize>(
+    bytes: &'a [u8],
+    mut emit: impl FnMut([&'a [u8]; N]),
+) {
+    assert!(N > 0);
+    let mut start = 0;
+    let mut ends = [0; N];
+    let mut commas = 0;
+    let mut saw_quote = false;
+
+    for (block, chunk) in bytes.chunks(32).enumerate() {
+        let (mut delimiters, newlines, mut quotes) = record_masks(chunk);
+        while delimiters != 0 {
+            let offset = delimiters.trailing_zeros();
+            let bit = 1 << offset;
+            delimiters &= delimiters - 1;
+            let end = block * 32 + offset as usize;
+            if newlines & bit == 0 {
+                // Saturate at N, which marks a row with too many fields.
+                if commas < N {
+                    ends[commas] = end;
+                    commas += 1;
+                }
+                continue;
+            }
+            let before_newline = bit - 1;
+            if commas == N - 1 && start < end {
+                ends[N - 1] = end;
+                emit_record(
+                    bytes,
+                    start,
+                    &ends,
+                    saw_quote || quotes & before_newline != 0,
+                    &mut emit,
+                );
+            }
+            quotes &= !before_newline;
+            saw_quote = false;
+            commas = 0;
+            start = end + 1;
+        }
+        saw_quote |= quotes != 0;
+    }
+
+    if commas == N - 1 && start < bytes.len() {
+        ends[N - 1] = bytes.len();
+        emit_record(bytes, start, &ends, saw_quote, &mut emit);
+    }
+}
+
+#[inline]
+fn emit_record<'a, const N: usize>(
+    bytes: &'a [u8],
+    mut start: usize,
+    ends: &[usize; N],
+    saw_quote: bool,
+    emit: &mut impl FnMut([&'a [u8]; N]),
+) {
+    let mut fields = std::array::from_fn(|i| {
+        let end = ends[i];
+        let field = &bytes[start..end];
+        start = end + 1;
+        field
+    });
+    if saw_quote {
+        for field in &mut fields {
+            let Some(value) = unquote(field) else {
+                return;
+            };
+            *field = value;
+        }
+    }
+    emit(fields);
+}
+
+/// Return masks for delimiters (comma or newline), newlines, and quotes.
+#[inline]
+fn record_masks(chunk: &[u8]) -> (u32, u32, u32) {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    if chunk.len() == 32 {
+        use std::arch::x86_64::*;
+        // Safety: the load is unaligned and the entire vector is in the slice.
+        return unsafe {
+            let v = _mm256_loadu_si256(chunk.as_ptr().cast());
+            let commas = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b',' as i8));
+            let newlines = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'\n' as i8));
+            let quotes = _mm256_cmpeq_epi8(v, _mm256_set1_epi8(b'"' as i8));
+            (
+                _mm256_movemask_epi8(_mm256_or_si256(commas, newlines)) as u32,
+                _mm256_movemask_epi8(newlines) as u32,
+                _mm256_movemask_epi8(quotes) as u32,
+            )
+        };
+    }
+
+    let (mut commas, mut newlines, mut quotes) = (0, 0, 0);
+    for (i, &byte) in chunk.iter().enumerate() {
+        match byte {
+            b',' => commas |= 1 << i,
+            b'\n' => newlines |= 1 << i,
+            b'"' => quotes |= 1 << i,
+            _ => {}
+        }
+    }
+    (commas | newlines, newlines, quotes)
+}
+
 /// Split one CSV line into its fields, applying the `rules.md` dialect.
 ///
 /// `line` is the bytes of one line, WITHOUT the terminating `\n`. (Any `\r` is
@@ -1046,6 +1157,64 @@ mod tests {
         fn below(&mut self, n: u64) -> u64 {
             self.next() % n
         }
+    }
+
+    fn assert_record_scan_matches_split_fields<const N: usize>(bytes: &[u8]) {
+        let mut expected = Vec::new();
+        let mut fields = Vec::new();
+        for line in bytes.split(|&b| b == b'\n') {
+            if split_fields(line, N, &mut fields) {
+                expected.push(spans(&fields));
+            }
+        }
+        let mut actual = Vec::new();
+        for_each_record::<N>(bytes, |row| actual.push(spans(&row)));
+        assert_eq!(actual, expected);
+    }
+
+    fn compare_random_records<const N: usize>(rng: &mut XorShift) {
+        for batch in 0..200 {
+            let mut bytes = Vec::new();
+            for row in 0..64 {
+                let count = match rng.below(8) {
+                    0 => 0,
+                    1 => N - 1,
+                    2 => N + 2,
+                    _ => N,
+                };
+                for field in 0..count {
+                    if field != 0 {
+                        bytes.push(b',');
+                    }
+                    let quote_style = rng.below(8);
+                    if matches!(quote_style, 0 | 1 | 2) {
+                        bytes.push(b'"');
+                    }
+                    let len = if row % 19 == 0 { rng.below(8192) } else { rng.below(20) };
+                    for _ in 0..len {
+                        bytes.push(b"a1 \r"[rng.below(4) as usize]);
+                    }
+                    if matches!(quote_style, 1 | 2 | 3) {
+                        bytes.push(b'"');
+                    }
+                    if quote_style == 2 {
+                        bytes.push(b'"');
+                    }
+                }
+                if row != 63 || batch % 2 == 0 {
+                    bytes.push(b'\n');
+                }
+            }
+            assert_record_scan_matches_split_fields::<N>(&bytes);
+        }
+    }
+
+    #[test]
+    fn record_scan_matches_split_fields_on_random_chunks() {
+        let mut rng = XorShift(0xC92B_4AA8_1963_204F);
+        compare_random_records::<4>(&mut rng);
+        compare_random_records::<7>(&mut rng);
+        assert_record_scan_matches_split_fields::<4>(b"\n,,,\"\n,,,\"\"\n,,,\"\"\"\n,,,\r");
     }
 
     #[test]

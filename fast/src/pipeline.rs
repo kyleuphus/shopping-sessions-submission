@@ -160,30 +160,17 @@ fn chunk_files<'a>(files: &[&'a [u8]]) -> Vec<Chunk<'a>> {
     chunks
 }
 
-/// Call `f` on every non-empty data line of a chunk, split ONLY on `\n` (a `\r`
-/// stays part of the line). Empty lines are skipped: rules.md makes them
-/// malformed, so skipping them here gives exactly the same answer as handing
-/// them to `split_fields` (which would reject them). This matches
-/// `csvline::data_lines` line for line otherwise.
+/// Skip the header by position, then parse complete rows in this chunk.
 #[inline]
-fn for_each_line<'a>(chunk: &Chunk<'a>, mut f: impl FnMut(&'a [u8])) {
-    let mut s = chunk.bytes;
+fn for_each_line<'a, const N: usize>(chunk: &Chunk<'a>, f: impl FnMut([&'a [u8]; N])) {
+    let mut bytes = chunk.bytes;
     if chunk.has_header {
-        match memchr::memchr(b'\n', s) {
-            Some(p) => s = &s[p + 1..],
-            None => return, // header only, no newline: no data
-        }
+        let Some(end) = memchr::memchr(b'\n', bytes) else {
+            return; // header only, no newline: no data
+        };
+        bytes = &bytes[end + 1..];
     }
-    let mut pos = 0;
-    for nl in memchr::memchr_iter(b'\n', s) {
-        if nl > pos {
-            f(&s[pos..nl]);
-        }
-        pos = nl + 1;
-    }
-    if pos < s.len() {
-        f(&s[pos..]);
-    }
+    crate::csvline::for_each_record(bytes, f);
 }
 
 /// A nonempty, already unquoted ID or user field in its source chunk.
@@ -299,7 +286,7 @@ struct PCl<'a> {
 
 /// Event within a person shard, keyed by a shard-local person id.
 struct Ev {
-    pid: u64,
+    pid: u32,
     ts: i64,
     price: u32,
     category: u32,
@@ -307,7 +294,7 @@ struct Ev {
 }
 
 struct Cl<'a> {
-    pid: u64,
+    pid: u32,
     ts: i64,
     campaign: u32,
     id: &'a [u8],
@@ -464,6 +451,116 @@ impl Stages {
     }
 }
 
+/// How many records ahead the hash-table loops prefetch. Far enough to cover a
+/// DRAM miss with several probes in flight, near enough that the line is still
+/// in L1 when the probe arrives.
+const PREFETCH_DIST: usize = 16;
+
+/// Hint the CPU to pull the cache line holding `p` into L1. Only a hint: it
+/// never faults, even on a bad address, and has no effect on results.
+#[inline(always)]
+fn prefetch_read<T>(p: *const T) {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: prefetch instructions never fault and do not access memory
+    // architecturally.
+    unsafe {
+        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+        _mm_prefetch(p as *const i8, _MM_HINT_T0);
+    }
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as above; `prfm` is a hint and never faults.
+    unsafe {
+        std::arch::asm!("prfm pldl1keep, [{p}]", p = in(reg) p, options(nostack, readonly, preserves_flags));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    let _ = p;
+}
+
+/// One slot of `LinkTab`: a linked ID's hash, its handle in `link_users`, and
+/// its person (union-find root). 16 bytes, so a slot never straddles a line.
+#[derive(Clone, Copy)]
+#[repr(C, align(16))]
+struct LinkSlot {
+    h: u64,
+    id: u32,
+    root: u32,
+}
+
+/// Linear-probing table from linked ID to person, built once after union-find.
+/// It exists so routing can prefetch a lookup's home slot from its hash ahead
+/// of time (std's HashMap does not expose bucket addresses). The bytes are
+/// still confirmed against `link_users` on every hash match: a hash match
+/// alone never identifies an ID.
+struct LinkTab {
+    slots: Vec<LinkSlot>,
+    mask: usize,
+}
+
+impl LinkTab {
+    const EMPTY: u32 = u32::MAX;
+
+    fn new(link_users: &Interner<'_>, roots: &[u32]) -> Self {
+        let n = link_users.len();
+        // Load factor <= 3/4 keeps linear-probe runs short for the ~38% of
+        // lookups that miss (unlinked IDs).
+        let cap = (n + n.div_ceil(3)).next_power_of_two().max(16);
+        let mask = cap - 1;
+        let mut slots = vec![LinkSlot { h: 0, id: Self::EMPTY, root: 0 }; cap];
+        for id in 0..n as u32 {
+            // Interner handles are distinct IDs, so no duplicate check.
+            let h = hash_bytes(link_users.bytes(id));
+            let mut s = (h as usize) & mask;
+            while slots[s].id != Self::EMPTY {
+                s = (s + 1) & mask;
+            }
+            slots[s] = LinkSlot { h, id, root: roots[id as usize] };
+        }
+        Self { slots, mask }
+    }
+
+    #[inline(always)]
+    fn prefetch(&self, h: u64) {
+        prefetch_read(self.slots.as_ptr().wrapping_add((h as usize) & self.mask));
+    }
+
+    /// The person of `user` if it is a linked ID. `h` must be `hash_bytes(user)`.
+    #[inline]
+    fn get(&self, link_users: &Interner<'_>, user: &[u8], h: u64) -> Option<u32> {
+        let mut s = (h as usize) & self.mask;
+        loop {
+            let slot = self.slots[s];
+            if slot.id == Self::EMPTY {
+                return None;
+            }
+            if slot.h == h && link_users.bytes(slot.id) == user {
+                return Some(slot.root);
+            }
+            s = (s + 1) & self.mask;
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn link_tab_agrees_with_interner_and_roots() {
+    // LinkTab::get must equal link_users.get(user).map(|id| roots[id]) for
+    // linked and unlinked IDs, including near-miss spellings.
+    let owned: Vec<Vec<u8>> = (0..20_000u32).map(|n| format!("u{n:07}").into_bytes()).collect();
+    let mut link_users = Interner::new();
+    let mut roots = Vec::new();
+    for (n, b) in owned.iter().enumerate().filter(|(n, _)| n % 3 != 0) {
+        let id = link_users.intern(b);
+        assert_eq!(id as usize, roots.len());
+        roots.push((n / 7) as u32);
+    }
+    let tab = LinkTab::new(&link_users, &roots);
+    let extra: Vec<&[u8]> = vec![b"", b" u0000001", b"u0000001 ", b"U0000001", b"u00000010"];
+    for b in owned.iter().map(|b| &b[..]).chain(extra) {
+        let want = link_users.get(b).map(|id| roots[id as usize]);
+        assert_eq!(tab.get(&link_users, b, hash_bytes(b)), want, "{:?}", b);
+    }
+}
+
 /// Read-only lookups for parsing and validating events and clicks: the window,
 /// products and campaigns. Built before any parallel stage; needs nothing from
 /// `links/`.
@@ -481,22 +578,58 @@ struct Lookups<'a> {
 struct People<'a> {
     /// Every ID that appears in a kept links line -> its handle in `link_users`.
     link_users: Interner<'a>,
-    /// Handle -> union-find root (its person).
-    roots: Vec<u32>,
+    /// Linked ID -> person (union-find root), for prefetchable routing lookups.
+    link_tab: LinkTab,
     /// Root -> handle of the byte-wise smallest ID in that person's component.
     root_name: Vec<u32>,
 }
 
 impl People<'_> {
     /// Which person a user ID belongs to, and which person shard that is.
+    /// `h` must be `hash_bytes(user)`: the same hash probes the link table
+    /// and, for an unlinked ID (~38% of calls), picks its shard, so the ID is
+    /// hashed once. Callers go through `Router`, which prefetches ahead.
     #[inline]
-    fn person(&self, user: &[u8]) -> (u32, usize) {
-        match self.link_users.get(user) {
-            Some(id) => {
-                let root = self.roots[id as usize];
-                (root, shard_of(fmix64(root as u64 ^ 0x5555)))
-            }
-            None => (NO_ROOT, shard_of(hash_bytes(user))),
+    fn person_hashed(&self, user: &[u8], h: u64) -> (u32, usize) {
+        debug_assert_eq!(h, hash_bytes(user));
+        match self.link_tab.get(&self.link_users, user, h) {
+            Some(root) => (root, shard_of(fmix64(root as u64 ^ 0x5555))),
+            None => (NO_ROOT, shard_of(h)),
+        }
+    }
+}
+
+/// Resolves persons for a stream of items in FIFO order, `PREFETCH_DIST` behind
+/// the hashing: each pushed item's user is hashed once, its `LinkTab` slot is
+/// prefetched, and it is resolved (and handed to `sink`) only after
+/// `PREFETCH_DIST` later items were pushed. Call `finish` to drain. Output order
+/// equals push order, so callers keep record order exactly.
+struct Router<'p, 'a, T> {
+    people: &'p People<'a>,
+    ring: std::collections::VecDeque<(T, u64)>,
+}
+
+impl<'p, 'a, T> Router<'p, 'a, T> {
+    fn new(people: &'p People<'a>) -> Self {
+        Self { people, ring: std::collections::VecDeque::with_capacity(PREFETCH_DIST + 1) }
+    }
+
+    #[inline]
+    fn push<'u>(&mut self, item: T, user: impl Fn(&T) -> &'u [u8], mut sink: impl FnMut(T, u32, usize)) {
+        let h = hash_bytes(user(&item));
+        self.people.link_tab.prefetch(h);
+        self.ring.push_back((item, h));
+        if self.ring.len() > PREFETCH_DIST {
+            let (it, h) = self.ring.pop_front().unwrap();
+            let (root, shard) = self.people.person_hashed(user(&it), h);
+            sink(it, root, shard);
+        }
+    }
+
+    fn finish<'u>(&mut self, user: impl Fn(&T) -> &'u [u8], mut sink: impl FnMut(T, u32, usize)) {
+        while let Some((it, h)) = self.ring.pop_front() {
+            let (root, shard) = self.people.person_hashed(user(&it), h);
+            sink(it, root, shard);
         }
     }
 }
@@ -504,56 +637,121 @@ impl People<'_> {
 /// Resolve `links/` into persons. Returns the time it took, for FAST_TIMING
 /// (it runs concurrently with event parse, so the stage clock can't see it).
 ///
-/// MUST stay sequential, in this exact order (files sorted by `csv_files`, lines
-/// in file order): handles are assigned in first-seen order, union-find roots
-/// depend on those handles, and the root picks the person shard
-/// (`fmix64(root ^ 0x5555)`) and the row order inside it. Any reordering -- e.g.
-/// interning in parallel -- changes which part file a user_daily row lands in,
-/// and breaks byte-identity of the output.
+/// Handle and root order can change because output row order and file count
+/// are unconstrained (rules.md:72).
 fn build_people(link_maps: &[Mmap]) -> (People<'_>, std::time::Duration) {
-    let started = std::time::Instant::now();
-    let mut fields: Vec<&[u8]> = Vec::with_capacity(8);
+    use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 
-    // rules.md: "Links come before everything else: an event or click is the
-    // person's as soon as it is parsed, whatever its own ID." Logically, yes; in
-    // this program nothing reads a person before dedup routing, so links can be
-    // built concurrently with event parse (see `run`).
-    let mut link_users = Interner::new();
-    let mut uf = UnionFind::new(0);
-    for map in link_maps {
-        for line in data_lines(map) {
-            if !split_fields(line, 2, &mut fields) {
-                continue;
-            }
-            // Links-specific rule: a line with either field empty is dropped.
-            if fields[0].is_empty() || fields[1].is_empty() {
-                continue;
-            }
-            let a = link_users.intern(fields[0]);
-            let b = link_users.intern(fields[1]);
-            uf.grow_to(link_users.len());
-            uf.union(a, b);
+    const PARTITIONS: usize = 32;
+
+    let started = std::time::Instant::now();
+    let files: Vec<&[u8]> = link_maps.iter().map(|map| &map[..]).collect();
+    let chunks = chunk_files(&files);
+    let parsed: Vec<_> = chunks
+        .par_iter()
+        .map(|chunk| {
+            let mut buckets = [const { Vec::new() }; PARTITIONS];
+            let mut edge_count = 0;
+            for_each_line(chunk, |[a, b]: [&[u8]; 2]| {
+                if a.is_empty() || b.is_empty() {
+                    return;
+                }
+                for (side, bytes) in [a, b].into_iter().enumerate() {
+                    let hash = hash_bytes(bytes);
+                    let partition = (hash as usize) & (PARTITIONS - 1);
+                    buckets[partition].push((edge_count * 2 + side, hash, bytes));
+                }
+                edge_count += 1;
+            });
+            (edge_count, buckets)
+        })
+        .collect();
+
+    let mut partitions = [const { Vec::new() }; PARTITIONS];
+    let mut edge_chunks = Vec::with_capacity(parsed.len());
+    for (edge_count, buckets) in parsed {
+        edge_chunks.push((edge_count, Vec::with_capacity(PARTITIONS)));
+        for (partition, bucket) in partitions.iter_mut().zip(buckets) {
+            partition.push(bucket);
         }
     }
-    let n_link = link_users.len();
-    let roots: Vec<u32> = (0..n_link as u32).map(|id| uf.find(id)).collect();
-    // Name each linked person by the byte-wise smallest of their IDs. This
-    // considers every linked ID, including ones never used in an event or click
-    // (rules.md, Linked IDs step 3; fixtures L2 and L3). An ID outside links/ is
-    // a person on its own and is named by itself, handled in the person stage.
-    let mut root_name: Vec<u32> = vec![u32::MAX; n_link];
-    for id in 0..n_link as u32 {
-        let r = roots[id as usize] as usize;
-        let current = root_name[r];
-        if current == u32::MAX || link_users.less(id, current) {
-            root_name[r] = id;
+
+    // Each endpoint's bytes determine its partition. The interner still checks
+    // the bytes on a hash match, so different IDs can share a hash.
+    let interned: Vec<_> = partitions
+        .into_par_iter()
+        .map(|buckets| {
+            let endpoints = buckets.iter().map(Vec::len).sum::<usize>();
+            let mut interner = Interner::with_capacity(endpoints / 2);
+            let handles: Vec<Vec<_>> = buckets
+                .into_iter()
+                .map(|bucket| {
+                    bucket
+                        .into_iter()
+                        .map(|(slot, hash, bytes)| (slot, interner.intern_hashed(bytes, hash)))
+                        .collect()
+                })
+                .collect();
+            (interner.into_keys(), handles)
+        })
+        .collect();
+
+    let mut keys = Vec::with_capacity(interned.iter().map(|(keys, _)| keys.len()).sum());
+    for (partition_keys, handles) in interned {
+        let base = u32::try_from(keys.len()).expect("too many linked IDs");
+        keys.extend(partition_keys);
+        for ((_, chunk), ids) in edge_chunks.iter_mut().zip(handles) {
+            chunk.push((base, ids));
         }
     }
+    let n_link = keys.len();
+    // The maximum u32 is reserved as an empty slot/name sentinel.
+    let n_ids = u32::try_from(n_link).expect("too many linked IDs");
+    let link_users = Interner::from_keys(keys);
+
+    let edges: Vec<_> = edge_chunks
+        .into_par_iter()
+        .map(|(edge_count, partitions)| {
+            let mut edges = vec![[0u32; 2]; edge_count];
+            for (base, ids) in partitions {
+                for (slot, id) in ids {
+                    edges[slot / 2][slot % 2] = base + id;
+                }
+            }
+            edges
+        })
+        .collect();
+    let mut uf = UnionFind::new(n_link);
+    for [a, b] in edges.into_iter().flatten() {
+        uf.union(a, b);
+    }
+    let roots: Vec<u32> = (0..n_ids).into_par_iter().map(|id| uf.root(id)).collect();
+
+    let (root_name, link_tab) = rayon::join(
+        || {
+            let names: Vec<_> = (0..n_link).map(|_| AtomicU32::new(u32::MAX)).collect();
+            roots.par_iter().enumerate().for_each(|(id, &root)| {
+                let id = id as u32;
+                let name = &names[root as usize];
+                // Each successful update lowers the component's name in byte
+                // order. Every linked ID competes, including IDs used only here.
+                let mut current = name.load(Relaxed);
+                while current == u32::MAX || link_users.less(id, current) {
+                    match name.compare_exchange_weak(current, id, Relaxed, Relaxed) {
+                        Ok(_) => break,
+                        Err(updated) => current = updated,
+                    }
+                }
+            });
+            names.into_iter().map(AtomicU32::into_inner).collect()
+        },
+        || LinkTab::new(&link_users, &roots),
+    );
 
     (
         People {
             link_users,
-            roots,
+            link_tab,
             root_name,
         },
         started.elapsed(),
@@ -574,11 +772,7 @@ fn parse_events(lk: &Lookups<'_>, event_chunks: &[Chunk<'_>]) -> Vec<Vec<Vec<ERe
                 "event chunk exceeds u32 offset limit"
             );
             let mut buckets: Vec<Vec<ERec>> = empty_buckets();
-            let mut fields: Vec<&[u8]> = Vec::with_capacity(8);
-            for_each_line(chunk, |line| {
-                if !split_fields(line, 7, &mut fields) {
-                    return;
-                }
+            for_each_line(chunk, |fields: [&[u8]; 7]| {
                 let id = fields[0];
                 if id.is_empty() {
                     return;
@@ -620,7 +814,7 @@ impl<'a> Lookups<'a> {
     /// Validate one event copy (rules.md Events steps 3 and 4). Returns
     /// `(ts, etype, category, price)` when the copy would survive.
     #[inline]
-    fn validate_event(&self, f: &[&'a [u8]], ingest: i64) -> Option<(i64, u8, u32, u32)> {
+    fn validate_event(&self, f: &[&'a [u8]; 7], ingest: i64) -> Option<(i64, u8, u32, u32)> {
         let (user, ts_field, etype_field, product, price_field) = (f[1], f[2], f[4], f[5], f[6]);
         if user.is_empty() || product.is_empty() {
             return None;
@@ -741,6 +935,49 @@ fn top_category<'c>(cat_rev: &[(u32, i64)], categories: &Interner<'c>) -> Option
     top.map(|(c, _)| String::from_utf8_lossy(categories.bytes(c)))
 }
 
+struct LocalUser<'a> {
+    hash: u64,
+    bytes: &'a [u8],
+}
+
+impl std::hash::Hash for LocalUser<'_> {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.hash);
+    }
+}
+
+impl PartialEq for LocalUser<'_> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        if self.hash != other.hash || self.bytes.len() != other.bytes.len() {
+            return false;
+        }
+        let (a, b) = (self.bytes, other.bytes);
+        // The first and last chunks overlap or touch, so together they cover
+        // every byte. Hash collisions still require an exact ID comparison.
+        match a.len() {
+            0 => true,
+            1 => a[0] == b[0],
+            2..=3 => {
+                a.first_chunk::<2>() == b.first_chunk::<2>()
+                    && a.last_chunk::<2>() == b.last_chunk::<2>()
+            }
+            4..=7 => {
+                a.first_chunk::<4>() == b.first_chunk::<4>()
+                    && a.last_chunk::<4>() == b.last_chunk::<4>()
+            }
+            8..=16 => {
+                a.first_chunk::<8>() == b.first_chunk::<8>()
+                    && a.last_chunk::<8>() == b.last_chunk::<8>()
+            }
+            _ => a == b,
+        }
+    }
+}
+
+impl Eq for LocalUser<'_> {}
+
 /// Dense shard-local person id: `0..pids.len()`, handed out in first-seen order,
 /// so the person stage can group records with a counting sort instead of a
 /// comparison sort.
@@ -755,7 +992,7 @@ fn top_category<'c>(cat_rev: &[(u32, i64)], categories: &Interner<'c>) -> Option
 /// one thread running that shard; Relaxed atomics just make the sharing legal.
 #[inline]
 fn local_pid<'d>(
-    local: &mut FastMap<&'d [u8], u32>,
+    local: &mut FastMap<LocalUser<'d>, u32>,
     root_dense: &[std::sync::atomic::AtomicU32],
     pids: &mut Vec<u64>,
     names: &mut Vec<&'d [u8]>,
@@ -774,7 +1011,8 @@ fn local_pid<'d>(
         pids.push(root as u64);
         return next;
     }
-    *local.entry(user).or_insert_with(|| {
+    let key = LocalUser { hash: hash_bytes(user), bytes: user };
+    *local.entry(key).or_insert_with(|| {
         pids.push((1u64 << 32) | names.len() as u64);
         names.push(user);
         next
@@ -853,9 +1091,8 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
 
     // ---- Links ‖ event parse, run concurrently.
     // Safe because event parse/validate reads only `lk`: the first read of a
-    // person is `people.person()` in dedup routing, after the join. Links stays
-    // one sequential task to preserve handle order (see `build_people`). Both
-    // closures use the existing Rayon pool.
+    // person is `people.person_hashed()` in dedup routing, after the join.
+    // Link processing and event parsing share the existing Rayon pool.
     let event_files: Vec<&[u8]> = event_maps.iter().map(|m| &m[..]).collect();
     let event_chunks = chunk_files(&event_files);
     let ((people, links_time), parsed) = rayon::join(
@@ -881,43 +1118,62 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
     let deduped: Vec<Vec<Vec<PEv>>> = event_pieces
         .into_par_iter()
         .map(|pieces| {
-            // Open-addressing table over this shard's copies, keyed by event_id.
-            // A slot holds (hash, location) of the best copy seen so far for one
-            // distinct event_id. Two copies are the same event only if their ids
-            // are byte-equal: a hash match alone is never trusted, so a 64-bit
-            // collision just probes on to another slot (a different event).
             let mut piece_bases = Vec::with_capacity(pieces.len());
             let mut n = 0usize;
             for (_, piece) in &pieces {
                 piece_bases.push(n);
                 n += piece.len();
             }
-            // Round up from a 2/3 worst-case load. Starting at twice the
-            // copy count can double the allocation and final slot scan when
-            // the shard size sits just above half a power of two.
-            let cap = (n + n.div_ceil(2)).next_power_of_two().max(16);
-            let mask = cap - 1;
-            const EMPTY: u64 = u64::MAX;
-            // location = piece << 32 | offset
-            let mut slots: Vec<(u64, u64)> = vec![(0, EMPTY); cap];
-            for (pi, (chunk, piece)) in pieces.iter().enumerate() {
+
+            // At roughly 8K copies per partition, a 16K-slot table occupies
+            // 256 KiB. Size each table from its actual count to handle skew.
+            const COPIES_PER_PARTITION: usize = 8192;
+            let partition_count = n.div_ceil(COPIES_PER_PARTITION).next_power_of_two();
+            let partition_mask = partition_count - 1;
+            let partition_shift = 64 - SHARD_BITS - partition_count.trailing_zeros();
+            let mut partitions = vec![Vec::new(); partition_count];
+            for (pi, (_, piece)) in pieces.iter().enumerate() {
                 for (oi, r) in piece.iter().enumerate() {
+                    // The top bits selected the shard. Use the next bits for
+                    // partitions and leave the low bits for home slots.
+                    let partition = ((r.h >> partition_shift) as usize) & partition_mask;
                     let loc = ((pi as u64) << 32) | oi as u64;
-                    // Low bits pick the slot; the top bits already picked the shard.
-                    let mut slot = (r.h as usize) & mask;
+                    partitions[partition].push((r.h, loc));
+                }
+            }
+
+            const EMPTY: u64 = u64::MAX;
+            let mut slots = Vec::new();
+            let mut winners = vec![0u64; n.div_ceil(64)];
+            for partition in partitions {
+                let count = partition.len();
+                if count == 0 {
+                    continue;
+                }
+                let cap = (count + count.div_ceil(2)).next_power_of_two().max(16);
+                let mask = cap - 1;
+                slots.clear();
+                slots.resize(cap, (0u64, EMPTY));
+
+                for (i, &(h, loc)) in partition.iter().enumerate() {
+                    if let Some(&(ahead_hash, _)) = partition.get(i + PREFETCH_DIST) {
+                        let home = ahead_hash as usize & mask;
+                        prefetch_read(slots.as_ptr().wrapping_add(home));
+                    }
+                    let mut slot = h as usize & mask;
                     loop {
                         let (sh, sloc) = slots[slot];
                         if sloc == EMPTY {
-                            slots[slot] = (r.h, loc);
+                            slots[slot] = (h, loc);
                             break;
                         }
-                        if sh == r.h {
+                        if sh == h {
+                            let (chunk, piece) = &pieces[(loc >> 32) as usize];
+                            let r = &piece[loc as u32 as usize];
                             let (kept_chunk, kept_piece) = &pieces[(sloc >> 32) as usize];
                             let kept = &kept_piece[sloc as u32 as usize];
                             if kept.id.bytes(kept_chunk) == r.id.bytes(chunk) {
-                                // Same event: keep the smallest ingest_ts. Equal
-                                // ingest_ts copies are identical (rules.md), so a
-                                // tie keeps either.
+                                // Equal ingest timestamps imply identical copies.
                                 if r.ingest < kept.ingest {
                                     slots[slot].1 = loc;
                                 }
@@ -927,16 +1183,16 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                         slot = (slot + 1) & mask;
                     }
                 }
-            }
-            // Mark final slot locations without loading the records in hash
-            // order. Then stream the pieces using one bit per input record.
-            let mut winners = vec![0u64; n.div_ceil(64)];
-            for (_, loc) in slots {
-                if loc != EMPTY {
-                    let piece = (loc >> 32) as usize;
-                    let offset = loc as u32 as usize;
-                    let index = piece_bases[piece] + offset;
-                    winners[index / 64] |= 1u64 << (index % 64);
+
+                // Each occupied slot holds the winning copy for one byte-equal
+                // ID. Mark its original index so routing can stream the pieces.
+                for &(_, loc) in &slots {
+                    if loc != EMPTY {
+                        let piece = (loc >> 32) as usize;
+                        let offset = loc as u32 as usize;
+                        let index = piece_bases[piece] + offset;
+                        winners[index / 64] |= 1u64 << (index % 64);
+                    }
                 }
             }
             let records = pieces
@@ -950,13 +1206,21 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
             });
             let mut counts = [0usize; SHARDS];
             let mut routes: Vec<(u32, u32)> = Vec::with_capacity(n);
-            for (chunk, r) in survivors.clone() {
-                let user = r.user.bytes(chunk);
-                let (root, shard) = people.person(user);
+            // Router resolves in push order (FIFO), so routes stay aligned
+            // with survivors; it only delays each lookup to prefetch ahead.
+            let mut router = Router::new(&people);
+            fn user_of<'u>(&(chunk, r): &(&'u [u8], &ERec)) -> &'u [u8] {
+                r.user.bytes(chunk)
+            }
+            let mut route = |_, root: u32, shard: usize| {
                 // Shard indices fit in u32, keeping each cached route at 8 bytes.
                 routes.push((root, shard as u32));
                 counts[shard] += 1;
+            };
+            for item in survivors.clone() {
+                router.push(item, user_of, &mut route);
             }
+            router.finish(user_of, &mut route);
             let mut out: Vec<Vec<PEv>> = counts.into_iter().map(Vec::with_capacity).collect();
             // Both passes visit the same survivors in record order, so the
             // cached routes line up with their records and bucket order is kept.
@@ -988,13 +1252,16 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
         .par_iter()
         .map(|chunk| {
             let mut buckets: Vec<Vec<PCl>> = empty_buckets();
-            let mut fields: Vec<&[u8]> = Vec::with_capacity(8);
-            for_each_line(chunk, |line| {
-                if !split_fields(line, 4, &mut fields) {
-                    return;
-                }
-                let (click_id, user, campaign_field, ts_field) =
-                    (fields[0], fields[1], fields[2], fields[3]);
+            let mut router = Router::new(&people);
+            fn click_user<'u>(c: &PCl<'u>) -> &'u [u8] {
+                c.user
+            }
+            fn with_root(mut c: PCl<'_>, root: u32) -> PCl<'_> {
+                c.root = root;
+                c
+            }
+            let mut route = |c, root: u32, shard: usize| buckets[shard].push(with_root(c, root));
+            for_each_line(chunk, |[click_id, user, campaign_field, ts_field]| {
                 if click_id.is_empty() || user.is_empty() {
                     return;
                 }
@@ -1012,15 +1279,11 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                 if campaign >= lk.real_campaign_count {
                     return;
                 }
-                let (root, shard) = people.person(user);
-                buckets[shard].push(PCl {
-                    user,
-                    root,
-                    ts: click_ts,
-                    campaign,
-                    id: click_id,
-                });
+                // The router fills in `root` and picks the bucket, in push order.
+                let click = PCl { user, root: NO_ROOT, ts: click_ts, campaign, id: click_id };
+                router.push(click, click_user, &mut route);
             });
+            router.finish(click_user, &mut route);
             buckets
         })
         .collect();
@@ -1052,7 +1315,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
             |(mut rows_acc, mut campaign_days), (shard, (ev_pieces, cl_pieces))| {
             // Dense shard-local person ids 0..n_persons (see `local_pid`);
             // `pids[d]` is person d's identity for `person_name`.
-            let mut local: FastMap<&[u8], u32> = FastMap::default();
+            let mut local: FastMap<LocalUser<'_>, u32> = FastMap::default();
             let mut local_names: Vec<&[u8]> = Vec::new();
             let mut pids: Vec<u64> = Vec::new();
             let n_ev: usize = ev_pieces.iter().map(|p| p.len()).sum();
@@ -1061,7 +1324,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                 for e in piece {
                     let d = local_pid(&mut local, &root_dense, &mut pids, &mut local_names, e.user, e.root);
                     evs.push(Ev {
-                        pid: d as u64,
+                        pid: d,
                         ts: e.ts,
                         price: e.price,
                         category: e.category,
@@ -1076,7 +1339,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                 for c in piece {
                     let d = local_pid(&mut local, &root_dense, &mut pids, &mut local_names, c.user, c.root);
                     cls.push(Cl {
-                        pid: d as u64,
+                        pid: d,
                         ts: c.ts,
                         campaign: c.campaign,
                         id: c.id,
@@ -1084,6 +1347,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                 }
             }
             drop(cl_pieces);
+            drop(local);
             let n_persons = pids.len();
 
             // Group by person in O(N) with a counting sort on the dense id, then
@@ -1136,7 +1400,9 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                 if i == j {
                     continue;
                 }
-                let pid = pids[d];
+                let name = String::from_utf8_lossy(person_name(
+                    pids[d], link_users, root_name, &local_names,
+                ));
                 let pclicks = &cls[cl_off[d]..cl_off[d + 1]];
                 sess.clear();
 
@@ -1154,7 +1420,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                     if day != cur_day {
                         if g_sessions > 0 {
                             user_rows.push(UserDailyRow {
-                                user_id: String::from_utf8_lossy(person_name(pid, link_users, root_name, &local_names)),
+                                user_id: name.clone(),
                                 day: cur_day,
                                 sessions: g_sessions,
                                 events: g_events,
@@ -1200,7 +1466,7 @@ pub fn run(data: &Path, output: &Path) -> Result<(), Box<dyn Error>> {
                 }
                 if g_sessions > 0 {
                     user_rows.push(UserDailyRow {
-                        user_id: String::from_utf8_lossy(person_name(pid, link_users, root_name, &local_names)),
+                        user_id: name,
                         day: cur_day,
                         sessions: g_sessions,
                         events: g_events,
