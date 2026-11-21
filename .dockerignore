@@ -1,0 +1,29 @@
+# Keep the build context small. The graders' build only needs fast/.
+# Without this, the context includes ~4 MB of dev-answer plus three copies of
+# the 36 fixtures, none of which the image uses.
+
+.git
+.github
+.claude
+
+# Generated datasets and run output
+dev/
+dev*/
+out/
+scratch/
+
+# Build artifacts
+**/target/
+__pycache__/
+*.pyc
+
+# The published answer and the starter kits are development aids only
+dev-answer/
+starter-duckdb/
+starter-polars/
+starter-pyspark/
+generator/
+
+# Docs
+*.md
+LICENSE
