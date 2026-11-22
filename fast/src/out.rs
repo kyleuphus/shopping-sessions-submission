@@ -15,6 +15,11 @@
 //! measures and user IDs, and its `-lz4` and `-snappy` variants compress pages.
 //! Every variant skips statistics and uses Int32 for counts only when all
 //! counts in the file fit. `revenue_cents` stays Int64.
+//!
+//! Each part file's write-back starts as soon as it is complete (Linux
+//! `sync_file_range`), so it overlaps the remaining parts' encoding and the
+//! container exit has less to flush: 0.972x external wall at v5 60M.
+//! `FAST_PQ_SYNC=0` turns it off.
 
 use std::borrow::Cow;
 use std::fs::File;
@@ -113,11 +118,47 @@ fn write_batch(
     static VARIANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let variant = VARIANT.get_or_init(|| std::env::var("FAST_PQ").ok());
     let props = writer_properties(variant.as_deref());
+    // A second handle to the same open file, kept so write-back can be started
+    // after the writer (which owns `file`) has closed it.
+    let sync_handle = if sync_enabled() { Some(file.try_clone()?) } else { None };
     let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
     writer.write(&batch)?;
     writer.close()?;
+    if let Some(handle) = sync_handle {
+        start_writeback(&handle);
+    }
     Ok(())
 }
+
+/// Start write-back of each part file as soon as it is complete, instead of
+/// leaving every dirty page for the container exit to flush. On by default;
+/// `FAST_PQ_SYNC=0` turns it off. Read once per process.
+///
+/// Measured (yb-bench, PGO container, scorer flags, v5 d60, one image, 7
+/// alternating pairs): external wall 5.770 -> 5.607 s (0.972x), 7/7 wins,
+/// ranges disjoint; internal `done in` unchanged (1.005x).
+fn sync_enabled() -> bool {
+    static SYNC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SYNC.get_or_init(|| std::env::var("FAST_PQ_SYNC").map_or(true, |v| v != "0"))
+}
+
+/// Ask the kernel to begin writing this file's dirty pages to disk, without
+/// waiting for it (`SYNC_FILE_RANGE_WRITE` only queues the I/O; offset 0 and
+/// length 0 mean the whole file). The remaining parts keep encoding while the
+/// earlier ones flush. It is a hint: the file's bytes are already complete in
+/// the page cache, so an error here cannot affect the output and is ignored.
+#[cfg(target_os = "linux")]
+fn start_writeback(file: &File) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: a valid open fd, borrowed for the duration of the call.
+    unsafe {
+        libc::sync_file_range(file.as_raw_fd(), 0, 0, libc::SYNC_FILE_RANGE_WRITE);
+    }
+}
+
+/// Not Linux (the Mac dev loop): no `sync_file_range`, so this does nothing.
+#[cfg(not(target_os = "linux"))]
+fn start_writeback(_file: &File) {}
 
 fn writer_properties(variant: Option<&str>) -> WriterProperties {
     use parquet::basic::Encoding;
