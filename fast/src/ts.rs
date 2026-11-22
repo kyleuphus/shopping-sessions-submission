@@ -349,7 +349,7 @@ impl DecodeCache {
                 // Treat the five offset bytes as HH:MM followed by zero
                 // seconds. XOR maps the ASCII zeroes and colon to zero.
                 let offset_digits = (load8(b, 17) >> 24) ^ 0x30_30_3a_30_30;
-                let (offset, bad_offset) = clock_seconds(offset_digits);
+                let (offset, bad_offset) = clock_seconds::<true>(offset_digits);
                 if (bad | bad_offset) == 0 {
                     let utc = if b[19] == b'-' { s + offset } else { s - offset };
                     return Some(utc * MS_PER_SEC);
@@ -365,12 +365,12 @@ impl DecodeCache {
         let head = load8(b, 0);
         let suffix = u64::from(u32::from_le_bytes(b[8..12].try_into().unwrap()) & 0xff_ffff);
         let (key, packed) = self.days[decode_day_slot(head, suffix)];
-        let (time, bad_clock) = clock_seconds(load8(b, 11) ^ u64::from_le_bytes(*b"00:00:00"));
+        let (time, bad_clock) = clock_seconds::<CHECK_CLOCK>(load8(b, 11) ^ u64::from_le_bytes(*b"00:00:00"));
         // Each real entry contains T. Check it explicitly to rule out a
         // match on an empty slot and an all-zero prefix.
         let bad_date = (key ^ head) | ((packed >> 40) ^ suffix) | ((suffix & 0xff_0000) ^ 0x54_0000);
         let midnight = ((packed << 24) as i64) >> 24;
-        (midnight + time, if CHECK_CLOCK { bad_date | bad_clock } else { bad_date })
+        (midnight + time, bad_date | bad_clock)
     }
 }
 
@@ -382,6 +382,12 @@ fn decode_day_slot(head: u64, suffix: u64) -> usize {
     (((head >> 42) & 64) | ((suffix & 3) << 4) | ((suffix >> 8) & 15)) as usize
 }
 
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[path = "ts/simd_clock.rs"]
+mod simd_clock;
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+use simd_clock::clock_seconds;
+
 #[inline(always)]
 fn epoch_slot(first: u64) -> usize {
     // Last digit of the prefix, plus the two low bits of its penultimate
@@ -389,8 +395,9 @@ fn epoch_slot(first: u64) -> usize {
     (((first >> 32) & 0xf) | ((first >> 20) & 0x30)) as usize
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "ssse3")))]
 #[inline(always)]
-fn clock_seconds(digits: u64) -> (i64, u64) {
+fn clock_seconds<const CHECK: bool>(digits: u64) -> (i64, u64) {
     // Two-digit values land at bytes 0 (hour), 3 (minute), and 6 (second).
     // Every valid digit pair fits in a byte, so the shift/add cannot carry
     // into the next pair. Any non-digit byte is rejected by the other check.
@@ -406,7 +413,7 @@ fn clock_seconds(digits: u64) -> (i64, u64) {
     let sec = pairs >> 48;
     (
         i64::from(hour) * 3600 + i64::from(min) * 60 + sec as i64,
-        bad_digit | bad_range,
+        if CHECK { bad_digit | bad_range } else { 0 },
     )
 }
 
