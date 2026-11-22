@@ -23,6 +23,10 @@
 //!   aggregate walk (semantics copied exactly).
 //! * **O** output rows -> Parquet via `out.rs`.
 //!
+//! `FAST_DECODE=0` selects the previous timestamp, event-key, and validation
+//! paths in P. Set `FAST_RAW_EVENT_HEX=1` to include source-backed event keys
+//! in a `FAST_PARSE_LEVEL` profiling run below level 6.
+//!
 //! Validity computed at parse does not break "dedup before validation":
 //! dedup only *selects* one copy; validity only decides whether the selected
 //! copy contributes. Both are per-copy facts, so the order of computing them
@@ -69,9 +73,10 @@ const MAX_PARTITION_BITS: u32 = 12; // partition ids must fit the u16 staging ta
 /// `Tok::rec` value meaning "this copy is invalid or late: it has no `Ev`".
 const NONE: u32 = u32::MAX;
 
-// A token-only tag: IdKey uses low nibbles 0 through 10. The low 24 bits
-// above the tag locate the unquoted hex ID within the original event chunk.
+// Token-only tags: IdKey uses low nibbles 0 through 10. For source IDs the low
+// 24 bits above the tag locate the unquoted 33-byte ID in the event chunk.
 // The upper 36 bits route and screen comparisons, never decide equality.
+const SHORT_EVENT_TAG: u64 = 14;
 const RAW_EVENT_TAG: u64 = 15;
 const RAW_EVENT_OFFSET_BITS: u32 = 24;
 const RAW_EVENT_OFFSET_MAX: u64 = (1 << RAW_EVENT_OFFSET_BITS) - 1;
@@ -96,6 +101,57 @@ fn source_event_id(bytes: &[u8], offset: u64) -> &[u8] {
     &bytes[offset..offset + crate::hexid::HEX_ID_LEN]
 }
 
+#[inline(always)]
+fn short_event_id(id: &[u8]) -> Option<IdKey> {
+    // The generator's most frequent ID is e followed by eight ASCII bytes.
+    // Dedup needs an exact identity but never orders event IDs by their bytes.
+    const ASCII: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+    if id.len() == 9 && id[0] == b'e' {
+        let suffix = u64::from_le_bytes(id[1..].try_into().unwrap());
+        if suffix & !ASCII == 0 {
+            #[cfg(all(target_arch = "x86_64", target_feature = "bmi2"))]
+            // SAFETY: BMI2 is enabled by the build target.
+            let packed = unsafe { std::arch::x86_64::_pext_u64(suffix, ASCII) } << 4;
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "bmi2")))]
+            let packed = {
+                // Save the low nibble in the unused high bits of the first
+                // four ASCII bytes (bits 7, 15, 23, 31). The four shifted
+                // copies of the nibble are disjoint before masking.
+                let spread = ((suffix & 15) * 0x1020_4080) & 0x8080_8080;
+                (suffix & !15) | spread
+            };
+            return Some(packed | SHORT_EVENT_TAG);
+        }
+    }
+    if id.len() == 8 && id[0] == b'e' {
+        let suffix = u64::from_le_bytes(id.try_into().unwrap()) >> 8;
+        return Some((1 << 63) | (suffix << 4) | SHORT_EVENT_TAG);
+    }
+    None
+}
+
+#[inline(always)]
+fn event_fingerprint(id: &[u8; crate::hexid::HEX_ID_LEN]) -> u64 {
+    // All 33 bytes are opaque here. Two unaligned loads and AES rounds avoid
+    // validating hexadecimal characters or packing nibbles to then hash them.
+    // A match on the retained 36 bits always goes through a full byte comparison.
+    #[cfg(all(target_arch = "x86_64", target_feature = "aes"))]
+    {
+        use std::arch::x86_64::*;
+        // SAFETY: AES is enabled, and bytes 1..17 and 17..33 are both in bounds.
+        unsafe {
+            let a = _mm_loadu_si128(id.as_ptr().add(1).cast());
+            let b = _mm_loadu_si128(id.as_ptr().add(17).cast());
+            let seed = _mm_set1_epi8(id[0] as i8);
+            let state = _mm_aesenc_si128(_mm_xor_si128(a, seed), b);
+            let state = _mm_aesenc_si128(state, _mm_setzero_si128());
+            _mm_cvtsi128_si64(_mm_aesenc_si128(state, seed)) as u64
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "aes")))]
+    crate::hash::hash_bytes(id)
+}
+
 // ---------------------------------------------------------------------------
 // Records
 // ---------------------------------------------------------------------------
@@ -104,7 +160,7 @@ fn source_event_id(bytes: &[u8], offset: u64) -> &[u8] {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 struct Tok {
-    /// Exact packed/interned ID or a tagged source reference in raw-hex mode.
+    /// Exact token key or a tagged source reference for a 33-byte ID.
     ekey: IdKey,
     /// `ingest_ts` in whole epoch seconds (guarded to fit u32).
     ingest_s: u32,
@@ -301,6 +357,42 @@ fn parse_digits(bytes: &[u8]) -> Option<i64> {
     Some(value)
 }
 
+// Canonical p1..p99999 and c_1..c_99999 have direct lookup slots. Other
+// spellings, including leading zeroes and arbitrary fixture IDs, use the map.
+const NUMBERED_IDS: usize = 100_000;
+
+#[inline(always)]
+fn numbered_id(id: &[u8], prefix: &[u8]) -> Option<usize> {
+    let digits = id.strip_prefix(prefix)?;
+    if !(1..=5).contains(&digits.len()) || digits[0] == b'0' {
+        return None;
+    }
+    ts::short_decimal(digits).map(|n| n as usize)
+}
+
+#[inline(always)]
+fn purchase_type(kind: &[u8]) -> Option<bool> {
+    match kind.len() {
+        4 => {
+            let word = u32::from_le_bytes(kind.try_into().unwrap());
+            ((word == u32::from_le_bytes(*b"view")) | (word == u32::from_le_bytes(*b"cart"))).then_some(false)
+        }
+        8 => (u64::from_le_bytes(kind.try_into().unwrap()) == u64::from_le_bytes(*b"purchase")).then_some(true),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn purchase_price(bytes: &[u8]) -> Option<u32> {
+    let value = if bytes.len() <= 8 {
+        i64::from(ts::short_decimal(bytes)?)
+    } else {
+        // Even a very long field can be valid when it has leading zeroes.
+        parse_digits(bytes)?
+    };
+    (1..=10_000_000).contains(&value).then_some(value as u32)
+}
+
 // ---------------------------------------------------------------------------
 // Timers
 // ---------------------------------------------------------------------------
@@ -438,9 +530,12 @@ struct Ctx<'a> {
     base: i64,
     /// product_id bytes -> index into the byte-sorted category name list.
     product_cat: FastMap<&'a [u8], u8>,
+    dense_products: Vec<u8>,
     unknown_cat: u8,
     campaigns: Interner<'a>,
+    dense_campaigns: Vec<u16>,
     real_campaign_count: u32,
+    decode: Option<ts::DecodeCache>,
     people: &'a PersonMap,
     ids: &'a IdInterner,
     parts: Parts,
@@ -489,6 +584,41 @@ impl Ctx<'_> {
         let cat = self.product_cat.get(product).copied().unwrap_or(self.unknown_cat);
         Some((event_ts, (price as u32) << 8 | u32::from(cat)))
     }
+
+    #[inline(always)]
+    fn validate_event_fast(&self, decode: &ts::DecodeCache, fields: &[&[u8]; 7], ingest_s: u32) -> Option<(i64, u32)> {
+        let product = fields[5];
+        if fields[1].is_empty() | product.is_empty() {
+            return None;
+        }
+        let is_purchase = purchase_type(fields[4])?;
+        let event_ts = decode.timestamp(fields[2])?;
+        let late_floor = i64::from(ingest_s) * 1000 - LATE_CUTOFF_MS;
+        if (event_ts < self.window_start) | (event_ts >= self.window_end) | (event_ts < late_floor) {
+            return None;
+        }
+        if !is_purchase {
+            return Some((event_ts, 0));
+        }
+        let price = purchase_price(fields[6])?;
+        let cat = if let Some(index) = numbered_id(product, b"p") {
+            self.dense_products[index]
+        } else {
+            self.product_cat.get(product).copied().unwrap_or(self.unknown_cat)
+        };
+        Some((event_ts, (price << 8) | u32::from(cat)))
+    }
+
+    #[inline(always)]
+    fn campaign_fast(&self, id: &[u8]) -> Option<u32> {
+        if let Some(index) = numbered_id(id, b"c_") {
+            let campaign = self.dense_campaigns[index];
+            return (campaign != u16::MAX).then_some(u32::from(campaign));
+        }
+        self.campaigns
+            .get(id)
+            .filter(|&campaign| campaign < self.real_campaign_count)
+    }
 }
 
 /// One event chunk after its scatter.
@@ -513,9 +643,23 @@ struct CkChunk {
     has_fallback_click: bool,
 }
 
-fn parse_event_chunk<const RAW_HEX: bool>(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChunk {
+#[cold]
+fn general_event_key(id: &[u8], ids: &IdInterner) -> IdKey {
+    key_of(id, ids)
+}
+
+fn parse_event_chunk<const RAW_HEX: bool, const DECODE: bool>(
+    ctx: &Ctx<'_>,
+    chunk: &Chunk<'_>,
+    chunk_id: usize,
+) -> EvChunk {
     let parts = ctx.parts;
     let level = ctx.parse_level;
+    let decode = if DECODE {
+        Some(ctx.decode.as_ref().unwrap())
+    } else {
+        None
+    };
     // Pre-size staging from the chunk size (~70-byte event lines) so the
     // pushes rarely reallocate and copy.
     let estimate = chunk.bytes.len() / 64 + 16;
@@ -542,39 +686,59 @@ fn parse_event_chunk<const RAW_HEX: bool>(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chun
         }
         // rules: "ingest_ts is always valid F1", so use the F1-only parser.
         // Anything else drops the line (never happens on spec-conforming data).
-        let Some(ingest_ms) = ts::parse_ingest_ts(fields[3]) else {
+        let ingest = if DECODE {
+            decode.unwrap().ingest_seconds(fields[3])
+        } else {
+            ts::parse_ingest_ts(fields[3])
+        };
+        let Some(ingest) = ingest else {
             return;
         };
-        // Width guard: ingest is stored as u32 seconds. F1 is whole seconds by
-        // construction, so only the range needs checking. One unsigned compare:
-        // a negative ingest_ms casts to a huge u64 and fails too.
-        if ingest_ms as u64 > u64::from(u32::MAX) * 1000 {
+        // The unsigned comparison also rejects negative epoch seconds.
+        let max_ingest = u64::from(u32::MAX) * if DECODE { 1 } else { 1000 };
+        if ingest as u64 > max_ingest {
+            let ingest_ms = if DECODE { ingest * 1000 } else { ingest };
             ctx.fallback.trip(format!("ingest_ts {ingest_ms} ms is not whole u32 seconds"));
             return;
         }
-        let ekey = if RAW_HEX {
-            if let Some((prefix, value)) = crate::hexid::try_parse(fields[0]) {
+        let event_id = fields[0];
+        let short = if DECODE { short_event_id(event_id) } else { None };
+        let ekey = if let Some(key) = short {
+            key
+        } else {
+            let fingerprint = if !RAW_HEX {
+                None
+            } else if DECODE {
+                <&[u8; crate::hexid::HEX_ID_LEN]>::try_from(event_id)
+                    .ok()
+                    .map(event_fingerprint)
+            } else {
+                crate::hexid::try_parse(event_id).map(|(prefix, value)| crate::hexid::fingerprint(prefix, value))
+            };
+            if let Some(fingerprint) = fingerprint {
                 // scan3's normalized fields borrow the original chunk.
-                let offset = fields[0].as_ptr() as usize - chunk.bytes.as_ptr() as usize;
-                debug_assert!(offset + fields[0].len() <= chunk.bytes.len());
+                let offset = event_id.as_ptr() as usize - chunk.bytes.as_ptr() as usize;
+                debug_assert!(offset + event_id.len() <= chunk.bytes.len());
                 if offset as u64 > RAW_EVENT_OFFSET_MAX {
                     ctx.fallback.trip("raw event ID offset exceeds 24 bits");
                     return;
                 }
-                (crate::hexid::fingerprint(prefix, value) << (RAW_EVENT_OFFSET_BITS + 4))
-                    | ((offset as u64) << 4)
-                    | RAW_EVENT_TAG
+                (fingerprint << (RAW_EVENT_OFFSET_BITS + 4)) | ((offset as u64) << 4) | RAW_EVENT_TAG
+            } else if DECODE {
+                general_event_key(event_id, ctx.ids)
             } else {
-                key_of(fields[0], ctx.ids)
+                key_of(event_id, ctx.ids)
             }
-        } else {
-            key_of(fields[0], ctx.ids)
         };
         if level < 3 {
             std::hint::black_box(ekey);
             return;
         }
-        let valid = ctx.validate_event(fields, ingest_ms);
+        let valid = if DECODE {
+            ctx.validate_event_fast(decode.unwrap(), fields, ingest as u32)
+        } else {
+            ctx.validate_event(fields, ingest)
+        };
         if level < 4 {
             std::hint::black_box(valid);
             return;
@@ -602,7 +766,7 @@ fn parse_event_chunk<const RAW_HEX: bool>(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chun
         };
         toks.push(Tok {
             ekey,
-            ingest_s: (ingest_ms / 1000) as u32,
+            ingest_s: if DECODE { ingest as u32 } else { (ingest / 1000) as u32 },
             rec,
         });
         let group_key = if RAW_HEX { routed_event_key(ekey) } else { ekey };
@@ -674,10 +838,20 @@ fn resolve_persons<T>(ctx: &Ctx<'_>, records: &mut [T], person: impl Fn(&mut T) 
     tags
 }
 
-fn parse_click_chunk<const SOURCE_IDS: bool>(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> CkChunk {
+fn parse_click_chunk<const SOURCE_IDS: bool, const DECODE: bool>(
+    ctx: &Ctx<'_>,
+    chunk: &Chunk<'_>,
+    chunk_id: usize,
+) -> CkChunk {
     let parts = ctx.parts;
     let level = ctx.parse_level;
     let click_start = ctx.base;
+    let click_span = (ctx.window_end - click_start).max(0) as u64;
+    let decode = if DECODE {
+        Some(ctx.decode.as_ref().unwrap())
+    } else {
+        None
+    };
     let mut cks = Vec::with_capacity(chunk.bytes.len() / 48 + 16); // ~55-byte click lines
     let mut has_fallback_click = false;
     if level < 1 {
@@ -694,21 +868,41 @@ fn parse_click_chunk<const SOURCE_IDS: bool>(ctx: &Ctx<'_>, chunk: &Chunk<'_>, c
         }
         let (click_id, user, campaign_id, ts_field) = (fields[0], fields[1], fields[2], fields[3]);
         // rules Clicks 1 and 3.
-        if click_id.is_empty() || user.is_empty() {
+        let empty_id = if DECODE {
+            click_id.is_empty() | user.is_empty()
+        } else {
+            click_id.is_empty() || user.is_empty()
+        };
+        if empty_id {
             return;
         }
-        let Some(click_ts) = ts::parse_ts(ts_field) else {
+        let click_ts = if DECODE {
+            decode.unwrap().timestamp(ts_field)
+        } else {
+            ts::parse_ts(ts_field)
+        };
+        let Some(click_ts) = click_ts else {
             return;
         };
-        if click_ts < click_start || click_ts >= ctx.window_end {
+        let outside = if DECODE {
+            (click_ts as u64).wrapping_sub(click_start as u64) >= click_span
+        } else {
+            click_ts < click_start || click_ts >= ctx.window_end
+        };
+        if outside {
             return;
         }
-        let Some(campaign) = ctx.campaigns.get(campaign_id) else {
+        let campaign = if DECODE {
+            ctx.campaign_fast(campaign_id)
+        } else {
+            // `organic` is interned after the real campaigns.
+            ctx.campaigns
+                .get(campaign_id)
+                .filter(|&campaign| campaign < ctx.real_campaign_count)
+        };
+        let Some(campaign) = campaign else {
             return;
         };
-        if campaign >= ctx.real_campaign_count {
-            return; // `organic` is interned after the real campaigns
-        }
         if level < 4 {
             std::hint::black_box((click_ts, campaign));
             return;
@@ -1726,6 +1920,237 @@ fn process_partition<'a>(
     *phase_walk += t_sorted.elapsed().as_secs_f64();
 }
 
+/// `FAST_S2=0` selects the original person stage + output path
+/// (`process_partition` with one owned `String` per row, all Parquet encoding
+/// after S). Anything else (or unset) selects `process_partition2`: columnar
+/// rows, bitmap gather, and Parquet parts encoded by the S workers themselves
+/// as their row buffers fill, overlapping O with S.
+fn s2_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FAST_S2").map_or(true, |v| v != "0"))
+}
+
+/// Append the live (not dedup-killed) entries of `evs[lo..hi]` to `out`, in
+/// order. Reads the dead bitmap one 64-bit word at a time: a word with no dead
+/// bit in range copies its whole run with one `extend_from_slice` (a memcpy),
+/// otherwise only the live bits are visited (`trailing_zeros` walk).
+#[inline]
+fn gather_live(evs: &[Ev], dead: &[AtomicU64], lo: usize, hi: usize, out: &mut Vec<Ev>) {
+    let mut i = lo;
+    while i < hi {
+        let word_index = i / 64;
+        let bit = i % 64;
+        // This step covers indices i..end, all inside one bitmap word.
+        let end = ((word_index + 1) * 64).min(hi);
+        let span = end - i;
+        let mask = if span == 64 { u64::MAX } else { (1u64 << span) - 1 };
+        // After the shift, bit j of `dead_here` is index i + j.
+        let dead_here = (dead[word_index].load(Ordering::Relaxed) >> bit) & mask;
+        if dead_here == 0 {
+            out.extend_from_slice(&evs[i..end]);
+        } else {
+            let mut live = !dead_here & mask;
+            while live != 0 {
+                out.push(evs[i + live.trailing_zeros() as usize]);
+                live &= live - 1; // clear the lowest set bit
+            }
+        }
+        i = end;
+    }
+}
+
+/// Like `top_category`, but returns the winning category's index (or
+/// `out::TOP_NULL` with no purchases). Same rule: highest summed revenue, tie
+/// -> smallest index = byte-wise smallest name.
+#[inline]
+fn top_category_index(revenues: &[(u8, i64)]) -> u16 {
+    let mut top: Option<(u8, i64)> = None;
+    for &(category, revenue) in revenues {
+        top = match top {
+            Some((best_category, best_revenue))
+                if !(revenue > best_revenue || (revenue == best_revenue && category < best_category)) =>
+            {
+                Some((best_category, best_revenue))
+            }
+            _ => Some((category, revenue)),
+        };
+    }
+    top.map_or(out::TOP_NULL, |(category, _)| u16::from(category))
+}
+
+/// The `FAST_S2` person stage for one partition. Same rules and results as
+/// `process_partition` (unit test `s2_matches_old_person_stage` compares them
+/// on random inputs), with these cost cuts:
+/// - gather reads the dead bitmap a word at a time (`gather_live`);
+/// - rows go into columnar buffers (`out::UserDailyCols`): the person's name
+///   is rendered once and its bytes appended per row, instead of one heap
+///   `String` per row;
+/// - session/day arithmetic runs on the u32 `ts_rel` values: the day of a
+///   session is `base_day + (base_rem + ts_rel) / MS_PER_DAY` (all
+///   non-negative, so a plain unsigned division instead of `div_euclid` on
+///   i64), and the 30-minute gap test is a u32 subtraction (events are sorted,
+///   so it never underflows).
+fn process_partition2(
+    partition: usize,
+    ev_chunks: &[EvChunk],
+    ck_chunks: &[CkChunk],
+    pc: &PersonCtx<'_>,
+    scratch: &mut Scratch,
+    campaign_days: &mut CampaignDays,
+    cols: &mut out::UserDailyCols,
+) {
+    let base = pc.base;
+    let ids = pc.ids;
+    let t_start = Instant::now();
+    let total: usize = ev_chunks
+        .iter()
+        .map(|c| (c.ev_off[partition + 1] - c.ev_off[partition]) as usize)
+        .sum();
+    scratch.evs.clear();
+    scratch.evs.reserve(total);
+    for chunk in ev_chunks {
+        let (lo, hi) = (chunk.ev_off[partition] as usize, chunk.ev_off[partition + 1] as usize);
+        gather_live(&chunk.evs, &chunk.dead, lo, hi, &mut scratch.evs);
+    }
+    scratch.cks.clear();
+    for chunk in ck_chunks {
+        let (lo, hi) = (chunk.ck_off[partition] as usize, chunk.ck_off[partition + 1] as usize);
+        scratch.cks.extend_from_slice(&chunk.cks[lo..hi]);
+    }
+    let t_gathered = Instant::now();
+    let radix = s_radix_enabled() && scratch.evs.len() >= RADIX_MIN_EVENTS;
+    let t_grouped = group_partition(scratch, pc.click_ids, radix);
+    let t_sorted = Instant::now();
+    scratch.phase[3] += (t_grouped - t_gathered).as_secs_f64();
+    scratch.phase[4] += (t_sorted - t_grouped).as_secs_f64();
+    scratch.phase[0] += (t_gathered - t_start).as_secs_f64();
+    scratch.phase[1] += (t_sorted - t_gathered).as_secs_f64();
+
+    let Scratch { index, evs_by, ev_off, cks_by, ck_off, sessions, starts, category_revenue, open, touched, name_bytes, phase, .. } =
+        scratch;
+    // base = base_day * MS_PER_DAY + base_rem with 0 <= base_rem < MS_PER_DAY,
+    // so (base + t).div_euclid(MS_PER_DAY) == base_day + (base_rem + t) / MS_PER_DAY
+    // for every t >= 0.
+    let base_day = base.div_euclid(MS_PER_DAY);
+    let base_rem = base.rem_euclid(MS_PER_DAY) as u64;
+    let day_of = |ts_rel: u32| (base_day + ((base_rem + u64::from(ts_rel)) / MS_PER_DAY as u64) as i64) as i32;
+    const GAP: u32 = SESSION_GAP_MS as u32;
+    const _: () = assert!(SESSION_GAP_MS <= u32::MAX as i64);
+
+    for (d, &person) in index.persons.iter().enumerate() {
+        let events = &evs_by[ev_off[d] as usize..ev_off[d + 1] as usize];
+        let person_clicks = &cks_by[ck_off[d] as usize..ck_off[d + 1] as usize];
+        // Borrowed (no allocation) whenever the name is valid UTF-8, which
+        // the old path's from_utf8_lossy would also have kept unchanged.
+        let person_name = String::from_utf8_lossy(key_bytes(person, ids, name_bytes));
+
+        // --- Sessionize (rules Events 5-6) ---
+        sessions.clear();
+        category_revenue.clear();
+        let mut current_day = i32::MIN;
+        let mut day_sessions = 0i64;
+        let mut day_events = 0i64;
+        let mut day_revenue = 0i64;
+        let mut index = 0;
+        while index < events.len() {
+            let start_rel = events[index].ts_rel;
+            let day = day_of(start_rel);
+            if day != current_day {
+                if day_sessions != 0 {
+                    cols.push(&person_name, current_day, day_sessions, day_events, day_revenue,
+                        top_category_index(category_revenue));
+                }
+                current_day = day;
+                day_sessions = 0;
+                day_events = 0;
+                day_revenue = 0;
+                category_revenue.clear();
+            }
+            let mut previous = start_rel;
+            let first = index;
+            let mut session_revenue = 0i64;
+            let mut has_purchase = false;
+            // Equal timestamps give gap 0, so they always share the session.
+            while index < events.len() && events[index].ts_rel - previous <= GAP {
+                let event = events[index];
+                if event.price() > 0 {
+                    let price = i64::from(event.price());
+                    session_revenue += price;
+                    has_purchase = true;
+                    let category = event.category();
+                    match category_revenue.iter_mut().find(|(c, _)| *c == category) {
+                        Some(entry) => entry.1 += price,
+                        None => category_revenue.push((category, price)),
+                    }
+                }
+                previous = event.ts_rel;
+                index += 1;
+            }
+            day_sessions += 1;
+            day_events += (index - first) as i64;
+            day_revenue += session_revenue;
+            sessions.push(Session { start_ts: base + i64::from(start_rel), day, revenue: session_revenue, has_purchase });
+        }
+        if day_sessions != 0 {
+            cols.push(&person_name, current_day, day_sessions, day_events, day_revenue,
+                top_category_index(category_revenue));
+        }
+
+        // --- Credit (rules Clicks 4-5): identical to process_partition. ---
+        let click_ts = |c: &Ck| base + i64::from(c.ts_rel);
+        let mut click_index = 0;
+        let mut latest_run_start = 0;
+        for session in sessions.iter() {
+            while click_index < person_clicks.len() && click_ts(&person_clicks[click_index]) <= session.start_ts {
+                if click_index == 0 || person_clicks[click_index].ts_rel != person_clicks[click_index - 1].ts_rel {
+                    latest_run_start = click_index;
+                }
+                click_index += 1;
+            }
+            let credited = if click_index != 0
+                && session.start_ts - click_ts(&person_clicks[click_index - 1]) <= SEVEN_DAYS_MS
+            {
+                u32::from(person_clicks[latest_run_start].camp)
+            } else {
+                pc.organic
+            };
+            let cell = campaign_days.at(credited, session.day);
+            cell.sessions += 1;
+            cell.revenue += session.revenue;
+            if session.has_purchase {
+                cell.purchasing_sessions += 1;
+            }
+        }
+
+        // --- Assists (rules Clicks 7): identical to process_partition. ---
+        if !person_clicks.is_empty() {
+            starts.clear();
+            starts.extend(sessions.iter().map(|session| session.start_ts));
+            for click in person_clicks {
+                let campaign = u32::from(click.camp);
+                let ts = click_ts(click);
+                let slot = &mut open[campaign as usize];
+                if slot.0 == i64::MIN {
+                    *slot = (ts, ts + SEVEN_DAYS_MS);
+                    touched.push(campaign);
+                } else if ts <= slot.1 {
+                    slot.1 = ts + SEVEN_DAYS_MS;
+                } else {
+                    add_assists(starts, slot.0, slot.1, campaign, campaign_days);
+                    *slot = (ts, ts + SEVEN_DAYS_MS);
+                }
+            }
+            for &campaign in touched.iter() {
+                let (first, last) = open[campaign as usize];
+                add_assists(starts, first, last, campaign, campaign_days);
+                open[campaign as usize] = (i64::MIN, i64::MIN);
+            }
+            touched.clear();
+        }
+    }
+    phase[2] += t_sorted.elapsed().as_secs_f64();
+}
+
 // ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
@@ -1754,7 +2179,11 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         return Ok(());
     }
     let base = window_start - SEVEN_DAYS_MS;
-    ts::set_window_hint(window_start, window_end);
+    let decode = (std::env::var_os("FAST_DECODE").as_deref() != Some(std::ffi::OsStr::new("0")))
+        .then(|| ts::DecodeCache::new(window_start, window_end));
+    if decode.is_none() {
+        ts::set_window_hint(window_start, window_end);
+    }
 
     let link_maps = map_all(&csv_files(&data.join("links")))?;
     let event_maps = map_all(&csv_files(&data.join("events")))?;
@@ -1783,9 +2212,19 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     let cat_index = |name: &[u8]| cat_names.binary_search(&name).expect("category listed") as u8;
     let unknown_cat = cat_index(b"unknown");
     let mut product_cat = FastMap::default();
+    let mut dense_products = if decode.is_some() {
+        vec![unknown_cat; NUMBERED_IDS]
+    } else {
+        Vec::new()
+    };
     for &(product, category) in &product_rows {
         // Later duplicate rows overwrite earlier ones, as in v2.
-        product_cat.insert(product, cat_index(category));
+        let category = cat_index(category);
+        if let Some(index) = decode.as_ref().and_then(|_| numbered_id(product, b"p")) {
+            dense_products[index] = category;
+        } else {
+            product_cat.insert(product, category);
+        }
     }
 
     let mut campaigns = Interner::new();
@@ -1806,6 +2245,18 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         fallback.trip(format!("{real_campaign_count} campaigns do not fit u16"));
         return Ok(());
     }
+    let mut dense_campaigns = if decode.is_some() {
+        vec![u16::MAX; NUMBERED_IDS]
+    } else {
+        Vec::new()
+    };
+    if decode.is_some() {
+        for campaign in 0..real_campaign_count {
+            if let Some(index) = numbered_id(campaigns.bytes(campaign), b"c_") {
+                dense_campaigns[index] = campaign as u16;
+            }
+        }
+    }
     let organic = campaigns.intern(b"organic");
     let organic_channel = channels.intern(b"organic");
     if organic as usize >= campaign_channel.len() {
@@ -1818,8 +2269,12 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(6);
-    let raw_hex = parse_level == 6 && std::env::var_os("FAST_RAW_EVENT_HEX").as_deref()
-        != Some(std::ffi::OsStr::new("0"));
+    let raw_event_setting = std::env::var_os("FAST_RAW_EVENT_HEX");
+    let raw_hex = match raw_event_setting.as_deref().and_then(std::ffi::OsStr::to_str) {
+        Some("0") => false,
+        Some("1") => true, // Also profile the full pipeline's event keys at levels 2–5.
+        _ => parse_level == 6,
+    };
 
     // --- L: links ---
     let compact_hex = raw_hex && std::env::var_os("FAST_COMPACT_HEX_TABLE").as_deref()
@@ -1849,9 +2304,12 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         window_end,
         base,
         product_cat,
+        dense_products,
         unknown_cat,
         campaigns,
+        dense_campaigns,
         real_campaign_count,
+        decode,
         people: &people,
         ids: &ids,
         parts,
@@ -1881,17 +2339,19 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         .with_max_len(1)
         .map(|&(is_event, i, _)| {
             if is_event {
-                let chunk = if raw_hex {
-                    parse_event_chunk::<true>(&ctx, &event_chunks[i], i)
-                } else {
-                    parse_event_chunk::<false>(&ctx, &event_chunks[i], i)
+                let chunk = match (raw_hex, ctx.decode.is_some()) {
+                    (true, true) => parse_event_chunk::<true, true>(&ctx, &event_chunks[i], i),
+                    (true, false) => parse_event_chunk::<true, false>(&ctx, &event_chunks[i], i),
+                    (false, true) => parse_event_chunk::<false, true>(&ctx, &event_chunks[i], i),
+                    (false, false) => parse_event_chunk::<false, false>(&ctx, &event_chunks[i], i),
                 };
                 Parsed::E(i, chunk)
             } else {
-                let chunk = if source_click_ids {
-                    parse_click_chunk::<true>(&ctx, &click_chunks[i], i)
-                } else {
-                    parse_click_chunk::<false>(&ctx, &click_chunks[i], i)
+                let chunk = match (source_click_ids, ctx.decode.is_some()) {
+                    (true, true) => parse_click_chunk::<true, true>(&ctx, &click_chunks[i], i),
+                    (true, false) => parse_click_chunk::<true, false>(&ctx, &click_chunks[i], i),
+                    (false, true) => parse_click_chunk::<false, true>(&ctx, &click_chunks[i], i),
+                    (false, false) => parse_click_chunk::<false, false>(&ctx, &click_chunks[i], i),
                 };
                 Parsed::C(i, chunk)
             }
@@ -1957,6 +2417,36 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     let campaign_count = ctx.campaigns.len();
     let next = AtomicUsize::new(0);
     let workers = rayon::current_num_threads().max(1);
+    let s2 = s2_enabled();
+    let user_dir = output.join("user_daily");
+    // S2: user_daily part files are written by the S workers (see below), so
+    // the folder must exist before S. Safe: no fallback check point can trip
+    // after P (all `fallback.trip` calls are in P and earlier), and P's check
+    // point is above, so v3 is committed to writing output by now.
+    if s2 {
+        std::fs::create_dir_all(&user_dir)?;
+    }
+    // Category index -> output string (as `top_category` renders it).
+    let cat_strs: Vec<Cow<str>> = cat_names.iter().map(|n| String::from_utf8_lossy(n)).collect();
+    // S2 flush size: a worker encodes a Parquet part as soon as it holds this
+    // many rows, overlapping the encode with other workers' person work.
+    let flush_rows: usize = std::env::var("FAST_S2_FLUSH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &usize| n > 0)
+        .unwrap_or(65_536);
+    let next_part = AtomicUsize::new(0);
+    // Encode one part from `cols` (leaving it empty) under a fresh part number.
+    let flush = |cols: &mut out::UserDailyCols, sums: &mut (i64, i64)| -> Result<(), String> {
+        sums.0 += cols.sessions.iter().sum::<i64>();
+        sums.1 += cols.revenue_cents.iter().sum::<i64>();
+        let part = next_part.fetch_add(1, Ordering::Relaxed);
+        out::write_user_daily_cols(&user_dir, part, std::mem::take(cols), &cat_strs).map_err(|e| e.to_string())
+    };
+    // Each S2 worker returns (sessions, revenue) summed over its rows, for
+    // the cross-table invariant, and its first write error if any.
+    type S2Out = ((i64, i64), Result<(), String>);
+    let s2_out: std::sync::Mutex<Vec<S2Out>> = std::sync::Mutex::new(Vec::new());
     // Each worker drains the shared queue; it owns its rows and campaign grid.
     type WorkerOut<'r> = (Vec<UserDailyRow<'r>>, CampaignDays, Vec<f64>, [f64; 5]);
     let worker_out: Vec<WorkerOut> = (0..workers)
@@ -1967,14 +2457,30 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
             let mut days = CampaignDays::new(campaign_count, window_start, window_end);
             let mut scratch = Scratch::new(real_campaign_count);
             let mut times = Vec::new();
+            let mut cols = out::UserDailyCols::default();
+            let mut sums = (0i64, 0i64);
+            let mut result: Result<(), String> = Ok(());
             loop {
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= order.len() {
                     break;
                 }
                 let started = Instant::now();
-                process_partition(order[i].0, &ev_chunks, &ck_chunks, &person_ctx, &mut scratch, &mut days, &mut rows);
+                if s2 {
+                    process_partition2(order[i].0, &ev_chunks, &ck_chunks, &person_ctx, &mut scratch, &mut days, &mut cols);
+                    if result.is_ok() && (cols.len() >= flush_rows || cols.name_bytes() >= 1 << 30) {
+                        result = flush(&mut cols, &mut sums);
+                    }
+                } else {
+                    process_partition(order[i].0, &ev_chunks, &ck_chunks, &person_ctx, &mut scratch, &mut days, &mut rows);
+                }
                 times.push(started.elapsed().as_secs_f64());
+            }
+            if s2 {
+                if result.is_ok() && !cols.is_empty() {
+                    result = flush(&mut cols, &mut sums);
+                }
+                s2_out.lock().unwrap().push((sums, result));
             }
             (rows, days, times, scratch.phase)
         })
@@ -2024,9 +2530,15 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
             assisted_sessions: accumulated.assisted_sessions,
         });
     });
-    let user_sessions: i64 = user_parts.iter().flatten().map(|row| row.sessions).sum();
+    let s2_out = s2_out.into_inner().unwrap();
+    let (mut user_sessions, mut user_revenue) = (0i64, 0i64);
+    for ((sessions, revenue), _) in &s2_out {
+        user_sessions += sessions;
+        user_revenue += revenue;
+    }
+    user_sessions += user_parts.iter().flatten().map(|row| row.sessions).sum::<i64>();
+    user_revenue += user_parts.iter().flatten().map(|row| row.revenue_cents).sum::<i64>();
     let campaign_sessions: i64 = campaign_rows.iter().map(|row| row.sessions).sum();
-    let user_revenue: i64 = user_parts.iter().flatten().map(|row| row.revenue_cents).sum();
     let campaign_revenue: i64 = campaign_rows.iter().map(|row| row.revenue_cents).sum();
     if user_sessions != campaign_sessions || user_revenue != campaign_revenue {
         eprintln!(
@@ -2039,7 +2551,29 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         return Ok(());
     }
 
-    let user_dir = output.join("user_daily");
+    if s2 {
+        for (_, result) in s2_out {
+            result?;
+        }
+        // Part 0 is always written (possibly empty) so the folder always
+        // holds a Parquet file.
+        if next_part.load(Ordering::Relaxed) == 0 {
+            out::write_user_daily_cols(&user_dir, 0, out::UserDailyCols::default(), &cat_strs)?;
+        }
+        out::write_campaign_daily(&output.join("campaign_daily"), &campaign_rows)?;
+        stages.mark("O output");
+        std::mem::forget(campaign_rows);
+        std::mem::forget(campaign_days);
+        std::mem::forget(ev_chunks);
+        std::mem::forget(ck_chunks);
+        std::mem::forget(ctx);
+        std::mem::forget(people);
+        std::mem::forget(ids);
+        std::mem::forget(event_maps);
+        std::mem::forget(click_maps);
+        std::mem::forget(link_maps);
+        return Ok(());
+    }
     std::fs::create_dir_all(&user_dir)?;
     // Split the workers' row vectors into ~equal slices, at least 16 and at
     // least 2 per thread, so the Parquet encoding runs in parallel without
@@ -2116,9 +2650,221 @@ mod tests {
     }
 
     #[test]
+    fn short_event_keys_are_exact_on_ascii_and_keep_widths_distinct() {
+        let mut seen = std::collections::HashMap::new();
+        for len in [8, 9] {
+            let mut id = *b"e01234567";
+            for pos in 1..len {
+                let original = id[pos];
+                for byte in 0..=255 {
+                    id[pos] = byte;
+                    let key = short_event_id(&id[..len]);
+                    assert_eq!(key.is_some(), len == 8 || byte.is_ascii());
+                    if let Some(key) = key {
+                        assert_eq!(key & 15, SHORT_EVENT_TAG);
+                        let bytes = id[..len].to_vec();
+                        if let Some(previous) = seen.insert(key, bytes.clone()) {
+                            assert_eq!(previous, bytes);
+                        }
+                    }
+                }
+                id[pos] = original;
+            }
+            id[0] = b'E';
+            assert!(short_event_id(&id[..len]).is_none());
+        }
+    }
+
+    #[test]
+    fn fast_prices_and_numbered_ids_match_exact_bytes() {
+        let oracle = |p: &[u8]| {
+            parse_digits(p)
+                .filter(|n| (1..=10_000_000).contains(n))
+                .map(|n| n as u32)
+        };
+        for price in [
+            b"".as_slice(),
+            b"0",
+            b"1",
+            b"0099",
+            b"10000000",
+            b"10000001",
+            b"000000000000010000000",
+            b"99999999999999999999999",
+            b"250\r",
+            b"+250",
+            b"25.0",
+            "２５０".as_bytes(),
+            "٢٥٠".as_bytes(),
+        ] {
+            assert_eq!(purchase_price(price), oracle(price), "{price:?}");
+        }
+        for len in 1..=8 {
+            let mut price = *b"12345678";
+            for i in 0..len {
+                let original = price[i];
+                for byte in 0..=255 {
+                    price[i] = byte;
+                    assert_eq!(purchase_price(&price[..len]), oracle(&price[..len]), "{price:?}");
+                }
+                price[i] = original;
+            }
+        }
+        for n in 1..NUMBERED_IDS {
+            let product = format!("p{n}");
+            assert_eq!(numbered_id(product.as_bytes(), b"p"), Some(n));
+        }
+        for id in [
+            b"p".as_slice(),
+            b"p0",
+            b"p01",
+            b"p100000",
+            b"P1",
+            b"p1\r",
+            b"p 1",
+            "p１".as_bytes(),
+        ] {
+            assert_eq!(numbered_id(id, b"p"), None, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn decode_modes_match_events_and_clicks_at_chunk_edges() {
+        let begin = ts::parse_ts(b"2028-02-29T00:00:00Z").unwrap();
+        let end = ts::parse_ts(b"2028-03-01T00:00:00Z").unwrap();
+        let ids = IdInterner::with_hex_log2(6);
+        let people = links2::build(&[], &ids);
+        let fallback = Fallback::default();
+        let mut campaigns = Interner::new();
+        let one = campaigns.intern(b"c_1");
+        campaigns.intern(b"c_01"); // Distinct from the canonical spelling.
+        campaigns.intern(b"organic");
+        let mut dense_campaigns = vec![u16::MAX; NUMBERED_IDS];
+        dense_campaigns[1] = one as u16;
+        let mut dense_products = vec![2; NUMBERED_IDS];
+        dense_products[1] = 0;
+        let ctx = Ctx {
+            window_start: begin,
+            window_end: end,
+            base: begin - SEVEN_DAYS_MS,
+            product_cat: [(b"p1".as_slice(), 0), (b"p01".as_slice(), 1)].into_iter().collect(),
+            dense_products,
+            unknown_cat: 2,
+            campaigns,
+            dense_campaigns,
+            real_campaign_count: 2,
+            decode: Some(ts::DecodeCache::new(begin, end)),
+            people: &people,
+            ids: &ids,
+            parts: Parts { bits: 4 },
+            k: K,
+            fallback: &fallback,
+            parse_level: 6,
+        };
+        let mut input = b"header\n\
+            e12345678,u,2028-02-29T00:00:00Z,2028-02-29T00:00:00Z,purchase,p1,\n\
+            E00000000000000000000000000000000,u,2028-02-29T00:00:00Z,2028-03-01T00:00:00Z,purchase,p01,0250\n\
+            e00000000000000000000000000000000,u,2028-02-29T00:00:00Z,2028-03-01T00:00:01Z,view,p1,ignored\n\
+            e76543210,u,2028-02-29T00:00:00Z,2028-02-29T00:00:01Z,purchase,p1,250\r\n\
+            e76543211,u,2028-02-29T00:00:00Z,2028-02-29T00:00:01Z,cart,p1,250\r\n\
+            e76543212,,2028-02-29T00:00:00Z,2028-02-29T00:00:01Z,view,p1,\n\
+            e76543213,u,2028-02-29T00:00:00Z,2028-02-29T00:00:01Z,view,,\n\
+            e76543214,u,2028-03-01T00:00:00Z,2028-02-29T00:00:01Z,view,p1,\n\
+            e76543215,u,2028-02-29T00:00:00Z,2028-02-29T00:00:01Z,View,p1,\n\
+            e76543216,u,2028-02-29T00:00:00Z,2028-02-29T00:00:01Z,view,p1,,extra\n"
+            .to_vec();
+        // The malformed padding straddles the target boundary. The following
+        // record becomes the first record of the second chunk, without a header.
+        input.resize(CHUNK_BYTES + 4, b'x');
+        input.extend_from_slice(
+            b"\n\
+            \"e12345678\",u,2028-02-29T00:00:00Z,2028-02-29T00:00:01Z,view,p1,\n\
+            \"E00000000000000000000000000000000\",u,2028-02-29T00:00:00Z,2028-03-01T00:00:00Z,purchase,p01,0250\n\
+            bad\"quote,u,2028-02-29T00:00:00Z,2028-02-29T00:00:00Z,view,p1,\n\
+            ebcdefghi,\"u\",2028-02-29T00:00:00-00:00,2028-02-28T23:59:59Z,purchase,p99999,000000000500",
+        );
+        let chunks = chunk_files(&[&input]);
+        assert_eq!(chunks.len(), 2);
+        let parse_events = |fast| {
+            chunks
+                .iter()
+                .enumerate()
+                .map(|(i, chunk)| {
+                    if fast {
+                        parse_event_chunk::<true, true>(&ctx, chunk, i)
+                    } else {
+                        parse_event_chunk::<true, false>(&ctx, chunk, i)
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let winners = |fast, sorted| {
+            let parsed = parse_events(fast);
+            let mut scratch = DedupScratch::default();
+            for part in 0..ctx.parts.count() {
+                if sorted {
+                    dedup_raw_sorted(&parsed, &chunks, part, ctx.k);
+                } else {
+                    assert!(dedup_stream_inner::<true>(
+                        &parsed,
+                        &chunks,
+                        part,
+                        ctx.k,
+                        &mut scratch,
+                        DEDUP_SCRATCH_BYTES
+                    ));
+                }
+            }
+            let mut keys = Vec::new();
+            for (i, chunk) in parsed.iter().enumerate() {
+                for (j, event) in chunk.evs.iter().enumerate() {
+                    if !dead(&parsed, i, j) {
+                        keys.push((event.person, event.ts_rel, event.pc));
+                    }
+                }
+            }
+            keys.sort_unstable();
+            keys
+        };
+        let old = winners(false, false);
+        assert_eq!(old.len(), 3);
+        assert_eq!(
+            old.iter().map(|row| row.2).collect::<Vec<_>>(),
+            [0, (250 << 8) | 1, (500 << 8) | 2]
+        );
+        assert_eq!(winners(true, false), old);
+        assert_eq!(winners(true, true), old);
+        assert!(!fallback.is_set());
+
+        let clicks = [Chunk {
+            has_header: true,
+            bytes: b"header\n\
+                \"z\",u,c_1,2028-02-22T00:00:00Z\n\
+                \"a\",\"u\",\"c_01\",2028-02-22T00:00:00-00:00\n\
+                a,u,c_01,2028-02-22T00:00:00Z\n\
+                early,u,c_1,2028-02-21T23:59:59Z\n\
+                end,u,c_1,2028-03-01T00:00:00Z\n\
+                cr,u,c_1,2028-02-22T00:00:00Z\r\n\
+                extra,u,c_1,2028-02-22T00:00:00Z,\n\
+                ,u,c_1,2028-02-22T00:00:00Z\n\
+                no-user,,c_1,2028-02-22T00:00:00Z\n\
+                hole,u,c_2,2028-02-22T00:00:00Z\n\
+                organic,u,organic,2028-02-22T00:00:00Z",
+        }];
+        let mut new = parse_click_chunk::<true, true>(&ctx, &clicks[0], 0).cks;
+        let old = parse_click_chunk::<true, false>(&ctx, &clicks[0], 0).cks;
+        assert_eq!(new, old);
+        sort_clicks_with_source_ids(&mut new, &clicks);
+        // The source sort places the winner first within each timestamp tie.
+        assert_eq!(new[0].camp, 1);
+        assert_eq!(new.iter().filter(|click| click.camp == 1).count(), 2);
+        assert!(new.iter().all(|click| click.ts_rel == 0));
+    }
+
+    #[test]
     fn raw_event_fingerprint_collisions_preserve_exact_winners_in_both_kernels() {
         let raw_a = crate::hexid::render(b'e', 7);
-        let raw_b = crate::hexid::render(b'u', 7);
+        let raw_b = *b"E00000000000000000000000000000007";
         let mut bytes = raw_a.to_vec();
         bytes.extend_from_slice(&raw_b);
         let input = [Chunk { bytes: &bytes, has_header: false }; 2];
@@ -2570,6 +3316,140 @@ mod tests {
     /// Differential: radix pre-sort + stable grouping vs the old per-person
     /// sort. For every person the event slice must be the same multiset and
     /// sorted by ts_rel; the person set must match (dense order may differ).
+    /// FAST_S2 vs the original person stage on random multi-chunk partitions:
+    /// dead bits at word edges, equal timestamps, sessions across midnight
+    /// with a base that is not day-aligned, ties in category revenue, click
+    /// ties, packed / long (interner) / non-UTF-8 names, persons without
+    /// clicks and clicks without events. User rows (as multisets) and the
+    /// campaign grid must be identical.
+    #[test]
+    fn s2_matches_old_person_stage() {
+        let ids = IdInterner::new();
+        let mut rng = Rng(0x5_2_a77ac);
+        let cat_names: Vec<&[u8]> = vec![b"a", b"b", b"cat", b"unknown", b"zz"];
+        let names: Vec<Vec<u8>> = (0..40)
+            .map(|i| match i % 4 {
+                0 => format!("u{i}").into_bytes(),
+                1 => format!("U{i}-a-rather-long-user-identifier-{i}").into_bytes(),
+                2 => vec![b'x', 0xff, b'0' + (i % 10) as u8, 0xfe], // invalid UTF-8
+                _ => format!("p {i}\r").into_bytes(),
+            })
+            .collect();
+        let keys: Vec<IdKey> = names.iter().map(|n| key_of(n, &ids)).collect();
+        let click_keys: Vec<IdKey> = (0..50).map(|i| key_of(format!("c{:03}", i).as_bytes(), &ids)).collect();
+        let window_start = 20_000 * MS_PER_DAY + 12_345_678;
+        let window_end = window_start + 6 * MS_PER_DAY;
+        let base = window_start - SEVEN_DAYS_MS;
+        let campaigns = 4u32; // 0..3 real, 4 = organic
+        let (mut total_rows, mut total_assists, mut total_tops) = (0usize, 0i64, 0usize);
+        for round in 0..200 {
+            let parts = 2usize;
+            let nchunks = 1 + rng.below(4) as usize;
+            let mut ev_chunks = Vec::new();
+            let mut ck_chunks = Vec::new();
+            let span = (window_end - window_start) as u64;
+            let narrow = round % 3 == 0; // few distinct ts -> many ties / short gaps
+            for _ in 0..nchunks {
+                let mut evs: Vec<Vec<Ev>> = vec![Vec::new(); parts];
+                let mut cks: Vec<Vec<Ck>> = vec![Vec::new(); parts];
+                for _ in 0..rng.below(300) {
+                    let person = keys[rng.below(if round % 2 == 0 { 6 } else { 40 }) as usize];
+                    let off = if narrow { rng.below(40) * 600_000 + (span / 2) } else { rng.below(span) };
+                    let ts_rel = (SEVEN_DAYS_MS as u64 + off) as u32;
+                    let cat = rng.below(cat_names.len() as u64) as u32;
+                    let price = if rng.below(3) == 0 { [1u32, 5, 100, 10_000_000][rng.below(4) as usize] } else { 0 };
+                    evs[(person % parts as u64) as usize].push(Ev { person, ts_rel, pc: price << 8 | cat });
+                }
+                for _ in 0..rng.below(120) {
+                    let person = keys[rng.below(if round % 2 == 0 { 8 } else { 40 }) as usize];
+                    let ts_rel = if narrow {
+                        (SEVEN_DAYS_MS as u64 + span / 2 - rng.below(20) * 600_000) as u32
+                    } else {
+                        rng.below(SEVEN_DAYS_MS as u64 + span) as u32
+                    };
+                    let click = click_keys[rng.below(click_keys.len() as u64) as usize];
+                    let camp = rng.below(u64::from(campaigns)) as u16;
+                    cks[(person % parts as u64) as usize].push(Ck { person, click, ts_rel, camp });
+                }
+                let mut ev_off = vec![0u32];
+                let mut all_evs = Vec::new();
+                for p in &evs {
+                    all_evs.extend_from_slice(p);
+                    ev_off.push(all_evs.len() as u32);
+                }
+                let mut ck_off = vec![0u32];
+                let mut all_cks = Vec::new();
+                for p in &cks {
+                    all_cks.extend_from_slice(p);
+                    ck_off.push(all_cks.len() as u32);
+                }
+                let dead: Vec<AtomicU64> = (0..all_evs.len().div_ceil(64))
+                    .map(|_| {
+                        AtomicU64::new(match rng.below(4) {
+                            0 => 0,
+                            1 => u64::MAX,
+                            _ => rng.next() & rng.next(),
+                        })
+                    })
+                    .collect();
+                ev_chunks.push(EvChunk { evs: all_evs, ev_off, toks: Vec::new(), tok_off: vec![0, 0], dead });
+                ck_chunks.push(CkChunk { cks: all_cks, ck_off, has_fallback_click: false });
+            }
+            let pc = PersonCtx {
+                base,
+                ids: &ids,
+                cat_names: &cat_names,
+                organic: campaigns,
+                click_ids: ClickIds::Interned { ids: &ids, any_fallback: true },
+            };
+            let mut old_scratch = Scratch::new(campaigns);
+            let mut new_scratch = Scratch::new(campaigns);
+            let mut old_days = CampaignDays::new(campaigns as usize + 1, window_start, window_end);
+            let mut new_days = CampaignDays::new(campaigns as usize + 1, window_start, window_end);
+            let mut old_rows = Vec::new();
+            let mut cols = out::UserDailyCols::default();
+            for partition in 0..parts {
+                process_partition(partition, &ev_chunks, &ck_chunks, &pc, &mut old_scratch, &mut old_days, &mut old_rows);
+                process_partition2(partition, &ev_chunks, &ck_chunks, &pc, &mut new_scratch, &mut new_days, &mut cols);
+                // gather_live vs the per-bit loop, on every sub-range edge.
+                for chunk in &ev_chunks {
+                    let (lo, hi) = (chunk.ev_off[partition] as usize, chunk.ev_off[partition + 1] as usize);
+                    for (a, b) in [(lo, hi), (lo + (hi - lo) / 3, hi), (lo, lo + (hi - lo) / 2)] {
+                        let mut fast = Vec::new();
+                        gather_live(&chunk.evs, &chunk.dead, a, b, &mut fast);
+                        let slow: Vec<Ev> = (a..b).filter(|&i| !is_dead(&chunk.dead, i)).map(|i| chunk.evs[i]).collect();
+                        assert_eq!(fast, slow, "round {round}: gather_live");
+                    }
+                }
+            }
+            let mut old: Vec<_> = old_rows
+                .iter()
+                .map(|r| (r.user_id.to_string(), r.day, r.sessions, r.events, r.revenue_cents, r.top_category.as_ref().map(|c| c.to_string())))
+                .collect();
+            let mut new: Vec<_> = (0..cols.len())
+                .map(|i| {
+                    let name = &cols.names[cols.offsets[i] as usize..cols.offsets[i + 1] as usize];
+                    let top = (cols.top[i] != out::TOP_NULL).then(|| String::from_utf8_lossy(cat_names[cols.top[i] as usize]).into_owned());
+                    (String::from_utf8(name.to_vec()).unwrap(), cols.day[i], cols.sessions[i], cols.events[i], cols.revenue_cents[i], top)
+                })
+                .collect();
+            old.sort();
+            new.sort();
+            assert_eq!(old, new, "round {round}: user rows differ");
+            let grid = |d: &CampaignDays| {
+                let mut v = Vec::new();
+                d.for_each_row(|c, day, x| v.push((c, day, x.sessions, x.purchasing_sessions, x.revenue, x.assisted_sessions)));
+                v
+            };
+            assert_eq!(grid(&old_days), grid(&new_days), "round {round}: campaign grid differs");
+            total_rows += new.len();
+            total_tops += new.iter().filter(|r| r.5.is_some()).count();
+            total_assists += grid(&new_days).iter().map(|r| r.5).sum::<i64>();
+        }
+        // The random inputs must actually exercise rows, purchases and assists.
+        assert!(total_rows > 2000 && total_tops > 500 && total_assists > 500, "{total_rows} {total_tops} {total_assists}");
+    }
+
     #[test]
     fn radix_grouping_matches_per_person_sort() {
         let ids = IdInterner::new();

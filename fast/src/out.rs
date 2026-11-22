@@ -229,6 +229,98 @@ pub fn write_user_daily<'r, 'a: 'r>(
     write_batch(dir, part, user_daily_schema(counts), columns)
 }
 
+/// Columnar user_daily rows, as the person stage builds them (`FAST_S2`, on by
+/// default). Instead of one owned `String` per row, every row's `user_id`
+/// bytes are appended to one shared `names` buffer, with Arrow-style offsets:
+/// row `i`'s name is `names[offsets[i]..offsets[i+1]]`. The buffers become the
+/// Arrow arrays directly (no per-row copy at write time). `top` holds the
+/// top category's index into the caller's category-name table, or `TOP_NULL`.
+#[derive(Default)]
+pub struct UserDailyCols {
+    /// Concatenated user_id bytes. Always valid UTF-8 (each name is pushed from a `&str`).
+    pub names: Vec<u8>,
+    /// `len() + 1` entries starting at 0 once any row is pushed (empty when no rows).
+    pub offsets: Vec<i32>,
+    pub day: Vec<i32>,
+    pub sessions: Vec<i64>,
+    pub events: Vec<i64>,
+    pub revenue_cents: Vec<i64>,
+    pub top: Vec<u16>,
+}
+
+/// `UserDailyCols::top` value meaning "no purchases": a null `top_category`.
+pub const TOP_NULL: u16 = u16::MAX;
+
+impl UserDailyCols {
+    pub fn len(&self) -> usize {
+        self.day.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.day.is_empty()
+    }
+
+    /// Bytes held in `names`; the caller flushes well before i32 offsets could overflow.
+    pub fn name_bytes(&self) -> usize {
+        self.names.len()
+    }
+
+    #[inline]
+    pub fn push(&mut self, user_id: &str, day: i32, sessions: i64, events: i64, revenue_cents: i64, top: u16) {
+        if self.offsets.is_empty() {
+            self.offsets.push(0);
+        }
+        self.names.extend_from_slice(user_id.as_bytes());
+        // Offsets are i32 in Arrow's StringArray; the caller flushes long
+        // before 2^31 bytes, and try_from turns any overflow into a panic
+        // rather than a silently wrong offset.
+        self.offsets.push(i32::try_from(self.names.len()).expect("user_id buffer exceeds i32 offsets"));
+        self.day.push(day);
+        self.sessions.push(sessions);
+        self.events.push(events);
+        self.revenue_cents.push(revenue_cents);
+        self.top.push(top);
+    }
+}
+
+/// Write one user_daily part file from columnar rows. `cat_names[i]` is the
+/// string for top index `i`. Consumes the buffers (they move into Arrow).
+pub fn write_user_daily_cols(
+    dir: &Path,
+    part: usize,
+    cols: UserDailyCols,
+    cat_names: &[Cow<'_, str>],
+) -> Result<(), Box<dyn std::error::Error>> {
+    use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
+    let UserDailyCols { names, mut offsets, day, sessions, events, revenue_cents, top } = cols;
+    if offsets.is_empty() {
+        offsets.push(0);
+    }
+    let counts = count_type(sessions.iter().chain(events.iter()).copied());
+    // `try_new` checks the offsets and that the bytes are valid UTF-8, so a
+    // bug upstream fails loudly instead of writing a corrupt file.
+    let user_id = StringArray::try_new(
+        OffsetBuffer::new(ScalarBuffer::from(offsets)),
+        Buffer::from_vec(names),
+        None,
+    )?;
+    let columns: Vec<ArrayRef> = vec![
+        Arc::new(user_id),
+        Arc::new(Date32Array::new(ScalarBuffer::from(day), None)),
+        count_column(&counts, sessions.iter().copied()),
+        count_column(&counts, events.iter().copied()),
+        Arc::new(Int64Array::new(ScalarBuffer::from(revenue_cents), None)),
+        Arc::new(StringArray::from_iter(top.iter().map(|&t| {
+            if t == TOP_NULL {
+                None
+            } else {
+                Some(cat_names[t as usize].as_ref())
+            }
+        }))),
+    ];
+    write_batch(dir, part, user_daily_schema(counts), columns)
+}
+
 pub fn write_campaign_daily(
     dir: &Path,
     rows: &[CampaignDailyRow],

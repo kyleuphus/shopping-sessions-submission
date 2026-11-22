@@ -254,6 +254,206 @@ fn swar_value8(x: u64) -> i64 {
     x as i64
 }
 
+const ASCII_ZEROS: u64 = u64::from_le_bytes(*b"00000000");
+const DECODE_DAY_SLOTS: usize = 128;
+
+// v3's decoder is tied to one input window. Cache the UTC second at midnight
+// alongside the exact 11-byte prefix, and the high five digits of common F3
+// fields alongside their epoch-ms contribution. The tables are accept-only.
+pub(crate) struct DecodeCache {
+    days: Box<[(u64, u64); DECODE_DAY_SLOTS]>,
+    epochs: [(u64, i64); 64],
+}
+
+impl DecodeCache {
+    pub(crate) fn new(window_start: i64, window_end: i64) -> Self {
+        let mut days = Box::new([(0, 0); DECODE_DAY_SLOTS]);
+        let start_day = window_start.div_euclid(MS_PER_DAY) - 8;
+        let end_day = (window_end.div_euclid(MS_PER_DAY) + 7).min(start_day + MAX_CACHE_DAYS);
+        for day in start_day..=end_day {
+            let (year, month, date) = civil_from_days(day);
+            if !(0..=9999).contains(&year) {
+                continue;
+            }
+            let prefix = format!("{year:04}-{month:02}-{date:02}T");
+            let prefix = prefix.as_bytes();
+            let head = load8(prefix, 0);
+            let suffix = u64::from(u32::from_le_bytes([prefix[8], prefix[9], b'T', 0]));
+            // Even year 9999 fits in the signed low 40 bits. The top 24 bits
+            // hold the rest of the prefix, so one cache entry is only 16 bytes.
+            let packed = (suffix << 40) | ((day * 86_400) as u64 & ((1 << 40) - 1));
+            let entry = &mut days[decode_day_slot(head, suffix)];
+            if entry.0 == 0 {
+                *entry = (head, packed);
+            }
+        }
+
+        let mut epochs = [(0, 0); 64];
+        let first = window_start
+            .saturating_sub(8 * MS_PER_DAY)
+            .div_euclid(100_000_000)
+            .max(10_000);
+        let last = window_end
+            .saturating_add(7 * MS_PER_DAY)
+            .div_euclid(100_000_000)
+            .min(99_999);
+        for prefix in first..=last.min(first + 64) {
+            let s = prefix.to_string();
+            let b = s.as_bytes();
+            let key = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], 0, 0, 0]);
+            epochs[epoch_slot(key)] = (key, prefix * 100_000_000);
+        }
+        Self { days, epochs }
+    }
+
+    /// F1 in whole epoch seconds, for the event dedup token.
+    #[inline(always)]
+    pub(crate) fn ingest_seconds(&self, b: &[u8]) -> Option<i64> {
+        if b.len() != F1_LEN || b[19] != b'Z' {
+            return None;
+        }
+        let (seconds, bad) = self.civil_seconds(b);
+        if bad == 0 {
+            Some(seconds)
+        } else {
+            exact_civil_seconds(b)
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn timestamp(&self, b: &[u8]) -> Option<i64> {
+        match b.len() {
+            F1_LEN if b[19] == b'Z' => return self.ingest_seconds(b).map(|s| s * MS_PER_SEC),
+            13 => {
+                let first = load8(b, 0);
+                let last = load8(b, 5) ^ ASCII_ZEROS;
+                let (key, prefix_ms) = self.epochs[epoch_slot(first)];
+                if key == first & 0xff_ffff_ffff && key != 0 && swar_all_le9(last) {
+                    return Some(prefix_ms + decode_value8(last));
+                }
+                return epoch13_exact(first ^ ASCII_ZEROS, last);
+            }
+            F2_LEN if matches!(b[19], b'+' | b'-') => {
+                let (s, bad) = self.civil_seconds(b);
+                // Treat the five offset bytes as HH:MM followed by zero
+                // seconds. XOR maps the ASCII zeroes and colon to zero.
+                let offset_digits = (load8(b, 17) >> 24) ^ 0x30_30_3a_30_30;
+                let (offset, bad_offset) = clock_seconds(offset_digits);
+                if (bad | bad_offset) == 0 {
+                    let utc = if b[19] == b'-' { s + offset } else { s - offset };
+                    return Some(utc * MS_PER_SEC);
+                }
+            }
+            _ => {}
+        }
+        exact_timestamp(b)
+    }
+
+    #[inline(always)]
+    fn civil_seconds(&self, b: &[u8]) -> (i64, u64) {
+        let head = load8(b, 0);
+        let suffix = u64::from(u32::from_le_bytes(b[8..12].try_into().unwrap()) & 0xff_ffff);
+        let (key, packed) = self.days[decode_day_slot(head, suffix)];
+        let (time, bad_clock) = clock_seconds(load8(b, 11) ^ u64::from_le_bytes(*b"00:00:00"));
+        // Each real entry contains T. Check it explicitly to rule out a
+        // match on an empty slot and an all-zero prefix.
+        let bad_date = (key ^ head) | ((packed >> 40) ^ suffix) | ((suffix & 0xff_0000) ^ 0x54_0000);
+        let midnight = ((packed << 24) as i64) >> 24;
+        (midnight + time, bad_date | bad_clock)
+    }
+}
+
+#[inline(always)]
+fn decode_day_slot(head: u64, suffix: u64) -> usize {
+    // Month parity and the two raw day digits distinguish every date in a
+    // 30-day range. A collision on a longer window just sends that date to
+    // the exact parser because the lookup compares the entire prefix.
+    (((head >> 42) & 64) | ((suffix & 3) << 4) | ((suffix >> 8) & 15)) as usize
+}
+
+#[inline(always)]
+fn epoch_slot(first: u64) -> usize {
+    // Last digit of the prefix, plus the two low bits of its penultimate
+    // digit. Close prefixes map to different slots even across midnight.
+    (((first >> 32) & 0xf) | ((first >> 20) & 0x30)) as usize
+}
+
+#[inline(always)]
+fn clock_seconds(digits: u64) -> (i64, u64) {
+    // Two-digit values land at bytes 0 (hour), 3 (minute), and 6 (second).
+    // Every valid digit pair fits in a byte, so the shift/add cannot carry
+    // into the next pair. Any non-digit byte is rejected by the other check.
+    const PAIRS: u64 = 0x00ff_0000_ff00_00ff;
+    const RANGE_BIAS: u64 = 0x0044_0000_4400_0068; // 127 minus each maximum
+    const DIGIT_BIAS: u64 = u64::from_le_bytes([0x76, 0x76, 0x7f, 0x76, 0x76, 0x7f, 0x76, 0x76]);
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let pairs = digits.wrapping_mul(10).wrapping_add(digits >> 8) & PAIRS;
+    let bad_digit = (digits | digits.wrapping_add(DIGIT_BIAS)) & HIGH;
+    let bad_range = pairs.wrapping_add(RANGE_BIAS) & (PAIRS & HIGH);
+    let hour = pairs as u8;
+    let min = (pairs >> 24) as u8;
+    let sec = pairs >> 48;
+    (
+        i64::from(hour) * 3600 + i64::from(min) * 60 + sec as i64,
+        bad_digit | bad_range,
+    )
+}
+
+#[cold]
+fn exact_civil_seconds(b: &[u8]) -> Option<i64> {
+    parse_civil(b).map(|(ms, _)| ms / MS_PER_SEC)
+}
+
+#[cold]
+fn exact_timestamp(b: &[u8]) -> Option<i64> {
+    parse_ts_exact_with(None, b)
+}
+
+#[cold]
+fn epoch13_exact(first: u64, last: u64) -> Option<i64> {
+    if !(swar_all_le9(first) & swar_all_le9(last)) {
+        return None;
+    }
+    Some(swar_value8(first << 24) * 100_000_000 + swar_value8(last))
+}
+
+#[inline(always)]
+fn decode_value8(digits: u64) -> i64 {
+    let pairs = digits.wrapping_mul(10).wrapping_add(digits >> 8);
+    const PAIR_LANES: u64 = 0x0000_00ff_0000_00ff;
+    // With two pairs per word, the high 32 bits of the products contain
+    // a*10^6 + c*10^2 and b*10^4 + d. The low 32 bits sum to < 10^4,
+    // so their addition cannot carry into the answer.
+    let ac = (pairs & PAIR_LANES).wrapping_mul((1_000_000 << 32) | 100);
+    let bd = ((pairs >> 16) & PAIR_LANES).wrapping_mul((10_000 << 32) | 1);
+    (ac.wrapping_add(bd) >> 32) as i64
+}
+
+/// Decode 1–8 ASCII digits. The two four-byte loads overlap for lengths 4–7.
+/// Left padding is numeric zero, and does not affect the value or validation.
+#[inline(always)]
+pub(crate) fn short_decimal(b: &[u8]) -> Option<u32> {
+    let len = b.len();
+    if (4..=8).contains(&len) {
+        let first = u32::from_le_bytes(b[..4].try_into().unwrap()) ^ 0x3030_3030;
+        let last = u32::from_le_bytes(b[len - 4..].try_into().unwrap()) ^ 0x3030_3030;
+        let digits = (u64::from(first) << ((8 - len) * 8)) | (u64::from(last) << 32);
+        return swar_all_le9(digits).then(|| decode_value8(digits) as u32);
+    }
+    if !(1..=3).contains(&len) {
+        return None;
+    }
+    let mut value = 0;
+    for &byte in b {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value * 10 + u32::from(digit);
+    }
+    Some(value)
+}
+
 /// Branch-light accept-only path for the three forms the data is made of: F1 (len 20)
 /// and F2 (len 25) whose date is in the window cache, and F3 of exactly 13 digits.
 ///
@@ -1802,10 +2002,11 @@ mod tests {
         let windows = test_windows();
         let caches: Vec<DateCache> =
             windows.iter().map(|&(a, b)| DateCache::for_window(a, b)).collect();
+        let decoders: Vec<_> = windows.iter().map(|&(a, b)| DecodeCache::new(a, b)).collect();
         let pool: &[u8] = b"0123456789-T:Z+tz /.,\r\x00\xff\xd9\xa2\xef\xbc\x92\x3a\x2f\xb0\xb9\x40";
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
         let mut hits = 0u64;
-        const N: usize = 400_000;
+        const N: usize = 2_000_000;
         for _ in 0..N {
             let wi = rng.below(windows.len() as u64) as usize;
             let (ws, we) = windows[wi];
@@ -1879,12 +2080,17 @@ mod tests {
             assert_same(Some(c), &s);
             let got = parse_ts_with(Some(c), &s);
             assert_eq!(
+                decoders[wi].timestamp(&s),
                 got,
-                parse_ts_uncached(&s),
                 "fuzz mismatch on {:?} ({:?}) window {:?}",
                 String::from_utf8_lossy(&s),
                 s,
                 (ws, we)
+            );
+            assert_eq!(
+                decoders[wi].ingest_seconds(&s),
+                parse_ingest_ts_with(Some(c), &s).map(|ms| ms / 1000),
+                "ingest on {s:?}"
             );
             if s.len() >= 19 && s[7] == b'-' && c.lookup(&s).is_some() {
                 hits += 1;
@@ -2027,6 +2233,7 @@ mod tests {
     fn common_paths_f3_every_length_and_byte() {
         let (ws, we) = (ms("2027-12-11T00:00:00Z"), ms("2027-12-25T00:00:00Z"));
         let caches = caches_all_modes(ws, we);
+        let decoder = DecodeCache::new(ws, we);
         let mut rng = Rng(0xD1B5_4A32_D192_ED03);
         for len in 1..=20usize {
             for _ in 0..2000 {
@@ -2049,6 +2256,7 @@ mod tests {
                 for c in &caches {
                     assert_eq!(parse_ts_with(Some(c), &v), parse_ts_uncached(&v), "{:?}", v);
                 }
+                assert_eq!(decoder.timestamp(&v), parse_ts_with(Some(&caches[2]), &v), "{v:?}");
                 assert_same(Some(&caches[0]), &v);
             }
         }
@@ -2062,6 +2270,7 @@ mod tests {
                     for c in &caches {
                         assert_eq!(parse_ts_with(Some(c), &v), parse_ts_uncached(&v));
                     }
+                    assert_eq!(decoder.timestamp(&v), parse_ts_with(Some(&caches[2]), &v), "{v:?}");
                 }
             }
         }
@@ -2074,6 +2283,7 @@ mod tests {
     fn common_paths_iso_every_byte_and_variants() {
         let (ws, we) = (ms("2028-02-20T00:00:00Z"), ms("2028-03-05T00:00:00Z"));
         let caches = caches_all_modes(ws, we);
+        let decoder = DecodeCache::new(ws, we);
         let bases = [
             "2028-02-29T00:00:00Z", "2028-02-29T23:59:59Z", "2028-02-28T12:00:00-02:00",
             "2028-02-29T00:14:48+12:00", "2028-03-01T00:00:00-10:00", "2028-02-29T00:00:00-00:00",
@@ -2091,6 +2301,7 @@ mod tests {
             for c in &caches {
                 assert_eq!(parse_ts_with(Some(c), bb), parse_ts_uncached(bb), "{base}");
             }
+            assert_eq!(decoder.timestamp(bb), parse_ts_with(Some(&caches[2]), bb), "{base}");
             for i in 0..bb.len() {
                 for byte in 0..=255u8 {
                     let mut v = bb.to_vec();
@@ -2099,6 +2310,12 @@ mod tests {
                     for c in &caches {
                         assert_eq!(parse_ts_with(Some(c), &v), parse_ts_uncached(&v));
                     }
+                    assert_eq!(decoder.timestamp(&v), parse_ts_with(Some(&caches[2]), &v), "{v:?}");
+                    assert_eq!(
+                        decoder.ingest_seconds(&v),
+                        parse_ingest_ts_with(Some(&caches[2]), &v).map(|ms| ms / 1000),
+                        "ingest on {v:?}"
+                    );
                 }
             }
         }
@@ -2106,6 +2323,39 @@ mod tests {
         for f in [&b"2028-02-29T00:00:00Z"[..], b"2028-02-29T00:00:00-02:00"] {
             assert!(parse_common(&caches[0], f).is_some());
             assert!(parse_common_br(&caches[0], f).is_some());
+        }
+    }
+
+    #[test]
+    fn decode_clock_exhausts_two_digit_times_and_offsets() {
+        let (ws, we) = (ms("2028-02-20T00:00:00Z"), ms("2028-03-05T00:00:00Z"));
+        let old = DateCache::for_window(ws, we);
+        let new = DecodeCache::new(ws, we);
+        // Every decimal spelling of hour, minute, and second, on a cached leap day.
+        let mut f1 = *b"2028-02-29T00:00:00Z";
+        let pair = |n: u8| [b'0' + n / 10, b'0' + n % 10];
+        for hour in 0..100 {
+            f1[11..13].copy_from_slice(&pair(hour));
+            for minute in 0..100 {
+                f1[14..16].copy_from_slice(&pair(minute));
+                for second in 0..100 {
+                    f1[17..19].copy_from_slice(&pair(second));
+                    let expected = parse_ingest_ts_with(Some(&old), &f1);
+                    assert_eq!(new.ingest_seconds(&f1), expected.map(|ms| ms / 1000), "{f1:?}");
+                    assert_eq!(new.timestamp(&f1), expected, "{f1:?}");
+                }
+            }
+        }
+        let mut f2 = *b"2028-02-29T00:03:14+00:00";
+        for sign in [b'+', b'-'] {
+            f2[19] = sign;
+            for hour in 0..100 {
+                f2[20..22].copy_from_slice(&pair(hour));
+                for minute in 0..100 {
+                    f2[23..25].copy_from_slice(&pair(minute));
+                    assert_eq!(new.timestamp(&f2), parse_ts_with(Some(&old), &f2), "{f2:?}");
+                }
+            }
         }
     }
 
