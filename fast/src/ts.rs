@@ -309,10 +309,21 @@ impl DecodeCache {
     /// F1 in whole epoch seconds, for the event dedup token.
     #[inline(always)]
     pub(crate) fn ingest_seconds(&self, b: &[u8]) -> Option<i64> {
+        self.f1_seconds::<true>(b)
+    }
+
+    /// The input contract guarantees valid F1 for the ingest column alone.
+    #[inline(always)]
+    pub(crate) fn trusted_ingest_seconds(&self, b: &[u8]) -> Option<i64> {
+        self.f1_seconds::<false>(b)
+    }
+
+    #[inline(always)]
+    fn f1_seconds<const CHECK_CLOCK: bool>(&self, b: &[u8]) -> Option<i64> {
         if b.len() != F1_LEN || b[19] != b'Z' {
             return None;
         }
-        let (seconds, bad) = self.civil_seconds(b);
+        let (seconds, bad) = self.civil_seconds::<CHECK_CLOCK>(b);
         if bad == 0 {
             Some(seconds)
         } else {
@@ -334,7 +345,7 @@ impl DecodeCache {
                 return epoch13_exact(first ^ ASCII_ZEROS, last);
             }
             F2_LEN if matches!(b[19], b'+' | b'-') => {
-                let (s, bad) = self.civil_seconds(b);
+                let (s, bad) = self.civil_seconds::<true>(b);
                 // Treat the five offset bytes as HH:MM followed by zero
                 // seconds. XOR maps the ASCII zeroes and colon to zero.
                 let offset_digits = (load8(b, 17) >> 24) ^ 0x30_30_3a_30_30;
@@ -350,7 +361,7 @@ impl DecodeCache {
     }
 
     #[inline(always)]
-    fn civil_seconds(&self, b: &[u8]) -> (i64, u64) {
+    fn civil_seconds<const CHECK_CLOCK: bool>(&self, b: &[u8]) -> (i64, u64) {
         let head = load8(b, 0);
         let suffix = u64::from(u32::from_le_bytes(b[8..12].try_into().unwrap()) & 0xff_ffff);
         let (key, packed) = self.days[decode_day_slot(head, suffix)];
@@ -359,7 +370,7 @@ impl DecodeCache {
         // match on an empty slot and an all-zero prefix.
         let bad_date = (key ^ head) | ((packed >> 40) ^ suffix) | ((suffix & 0xff_0000) ^ 0x54_0000);
         let midnight = ((packed << 24) as i64) >> 24;
-        (midnight + time, bad_date | bad_clock)
+        (midnight + time, if CHECK_CLOCK { bad_date | bad_clock } else { bad_date })
     }
 }
 
@@ -2341,6 +2352,9 @@ mod tests {
                 for second in 0..100 {
                     f1[17..19].copy_from_slice(&pair(second));
                     let expected = parse_ingest_ts_with(Some(&old), &f1);
+                    if let Some(ms) = expected {
+                        assert_eq!(new.trusted_ingest_seconds(&f1), Some(ms / 1000), "{f1:?}");
+                    }
                     assert_eq!(new.ingest_seconds(&f1), expected.map(|ms| ms / 1000), "{f1:?}");
                     assert_eq!(new.timestamp(&f1), expected, "{f1:?}");
                 }

@@ -831,9 +831,8 @@ fn parse_event_chunk<const RAW_HEX: bool, const DECODE: bool, const RAW_USERS: b
             return;
         }
         // rules: "ingest_ts is always valid F1", so use the F1-only parser.
-        // Anything else drops the line (never happens on spec-conforming data).
         let ingest = if DECODE {
-            decode.unwrap().ingest_seconds(fields.get(3))
+            decode.unwrap().trusted_ingest_seconds(fields.get(3))
         } else {
             ts::parse_ingest_ts(fields.get(3))
         };
