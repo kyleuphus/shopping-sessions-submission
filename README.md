@@ -1,3 +1,3 @@
 # Shopping Sessions (Databricks track)
 
-Rust pipeline v3, from private commit 0009c33. Build: docker build . ; MIT licensed.
+Rust pipeline v3 from source commit 865c931. Build with Docker. MIT licensed.

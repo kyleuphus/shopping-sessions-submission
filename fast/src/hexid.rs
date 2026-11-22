@@ -227,6 +227,11 @@ fn hash(prefix: u8, hi: u64, lo: u64) -> u64 {
     (x ^ (x >> 32)).wrapping_mul(0xd6e8_feb8_6659_fd93)
 }
 
+#[inline]
+pub(crate) fn fingerprint(prefix: u8, value: u128) -> u64 {
+    hash(prefix, (value >> 64) as u64, value as u64)
+}
+
 /// Wait for a BUSY slot to be published; returns the published meta.
 #[inline(never)]
 fn wait_published(slot: &Slot) -> u64 {

@@ -69,6 +69,33 @@ const MAX_PARTITION_BITS: u32 = 12; // partition ids must fit the u16 staging ta
 /// `Tok::rec` value meaning "this copy is invalid or late: it has no `Ev`".
 const NONE: u32 = u32::MAX;
 
+// A token-only tag: IdKey uses low nibbles 0 through 10. The low 24 bits
+// above the tag locate the unquoted hex ID within the original event chunk.
+// The upper 36 bits route and screen comparisons, never decide equality.
+const RAW_EVENT_TAG: u64 = 15;
+const RAW_EVENT_OFFSET_BITS: u32 = 24;
+const RAW_EVENT_OFFSET_MAX: u64 = (1 << RAW_EVENT_OFFSET_BITS) - 1;
+
+#[inline(always)]
+fn raw_event_id(key: IdKey) -> bool {
+    key & 15 == RAW_EVENT_TAG
+}
+
+#[inline(always)]
+fn routed_event_key(key: IdKey) -> IdKey {
+    if raw_event_id(key) {
+        key & !(RAW_EVENT_OFFSET_MAX << 4)
+    } else {
+        key
+    }
+}
+
+#[inline(always)]
+fn source_event_id(bytes: &[u8], offset: u64) -> &[u8] {
+    let offset = (offset & RAW_EVENT_OFFSET_MAX) as usize;
+    &bytes[offset..offset + crate::hexid::HEX_ID_LEN]
+}
+
 // ---------------------------------------------------------------------------
 // Records
 // ---------------------------------------------------------------------------
@@ -77,8 +104,7 @@ const NONE: u32 = u32::MAX;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(C)]
 struct Tok {
-    /// The `event_id`, packed (see key.rs). Raw equality is exact for packed
-    /// and fallback keys alike, which is all grouping needs.
+    /// Exact packed/interned ID or a tagged source reference in raw-hex mode.
     ekey: IdKey,
     /// `ingest_ts` in whole epoch seconds (guarded to fit u32).
     ingest_s: u32,
@@ -486,7 +512,7 @@ struct CkChunk {
     has_fallback_click: bool,
 }
 
-fn parse_event_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChunk {
+fn parse_event_chunk<const RAW_HEX: bool>(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChunk {
     let parts = ctx.parts;
     let level = ctx.parse_level;
     // Pre-size staging from the chunk size (~70-byte event lines) so the
@@ -525,7 +551,24 @@ fn parse_event_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChu
             ctx.fallback.trip(format!("ingest_ts {ingest_ms} ms is not whole u32 seconds"));
             return;
         }
-        let ekey = key_of(fields[0], ctx.ids);
+        let ekey = if RAW_HEX {
+            if let Some((prefix, value)) = crate::hexid::try_parse(fields[0]) {
+                // scan3's normalized fields borrow the original chunk.
+                let offset = fields[0].as_ptr() as usize - chunk.bytes.as_ptr() as usize;
+                debug_assert!(offset + fields[0].len() <= chunk.bytes.len());
+                if offset as u64 > RAW_EVENT_OFFSET_MAX {
+                    ctx.fallback.trip("raw event ID offset exceeds 24 bits");
+                    return;
+                }
+                (crate::hexid::fingerprint(prefix, value) << (RAW_EVENT_OFFSET_BITS + 4))
+                    | ((offset as u64) << 4)
+                    | RAW_EVENT_TAG
+            } else {
+                key_of(fields[0], ctx.ids)
+            }
+        } else {
+            key_of(fields[0], ctx.ids)
+        };
         if level < 3 {
             std::hint::black_box(ekey);
             return;
@@ -561,7 +604,8 @@ fn parse_event_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChu
             ingest_s: (ingest_ms / 1000) as u32,
             rec,
         });
-        tok_tag.push(parts.event(ekey) as u16);
+        let group_key = if RAW_HEX { routed_event_key(ekey) } else { ekey };
+        tok_tag.push(parts.event(group_key) as u16);
     });
 
     let ev_tag = resolve_persons(ctx, &mut evs, |e| &mut e.person);
@@ -796,6 +840,7 @@ const WIN_SLOT_BYTES: usize = std::mem::size_of::<WinSlot>() + std::mem::size_of
 struct DedupScratch {
     slots: Vec<WinSlot>,
     stamps: Vec<u32>,
+    sources: Vec<u64>,
     epoch: u32,
 }
 
@@ -834,6 +879,11 @@ fn ingest_rec(ingest_s: u32, rec: u32) -> u64 {
 /// Returns false, having marked nothing, if this partition's table would
 /// exceed `cap_bytes`; the caller must then use the sort path.
 fn dedup_stream(chunks: &[EvChunk], partition: usize, k: u32, scratch: &mut DedupScratch, cap_bytes: usize) -> bool {
+    dedup_stream_inner::<false>(chunks, &[], partition, k, scratch, cap_bytes)
+}
+
+fn dedup_stream_inner<const RAW_HEX: bool>(chunks: &[EvChunk], input: &[Chunk<'_>], partition: usize,
+    k: u32, scratch: &mut DedupScratch, cap_bytes: usize) -> bool {
     let n: usize = chunks
         .iter()
         .map(|c| (c.tok_off[partition + 1] - c.tok_off[partition]) as usize)
@@ -843,12 +893,16 @@ fn dedup_stream(chunks: &[EvChunk], partition: usize, k: u32, scratch: &mut Dedu
     }
     // Load factor <= 1/2, so a probe always finds an empty slot or its key.
     let size = n.saturating_mul(2).next_power_of_two();
-    if size.saturating_mul(WIN_SLOT_BYTES) > cap_bytes {
+    let entry_bytes = WIN_SLOT_BYTES + if RAW_HEX { std::mem::size_of::<u64>() } else { 0 };
+    if size.saturating_mul(entry_bytes) > cap_bytes {
         return false;
     }
     if scratch.slots.len() < size {
         scratch.slots.resize(size, WinSlot::default());
         scratch.stamps.resize(size, 0); // 0 is never a live epoch (see below)
+    }
+    if RAW_HEX && scratch.sources.len() < size {
+        scratch.sources.resize(size, 0);
     }
     if scratch.epoch == u32::MAX {
         scratch.stamps.fill(0);
@@ -860,23 +914,34 @@ fn dedup_stream(chunks: &[EvChunk], partition: usize, k: u32, scratch: &mut Dedu
     let slots = &mut scratch.slots[..size];
     let stamps = &mut scratch.stamps[..size];
     let dead = DeadView { chunks, k };
-    for chunk in chunks {
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
         let slice = &chunk.toks[chunk.tok_off[partition] as usize..chunk.tok_off[partition + 1] as usize];
         for tok in slice {
-            let mut i = fmix64(tok.ekey ^ DEDUP_SALT) as usize & mask;
+            let from_source = RAW_HEX && raw_event_id(tok.ekey);
+            let key = if RAW_HEX { routed_event_key(tok.ekey) } else { tok.ekey };
+            let mut i = fmix64(key ^ DEDUP_SALT) as usize & mask;
             loop {
                 if stamps[i] != epoch {
                     // First copy of this event: it is the winner so far.
                     stamps[i] = epoch;
                     slots[i] = WinSlot {
-                        ekey: tok.ekey,
+                        ekey: key,
                         ingest_s: tok.ingest_s,
                         rec: tok.rec,
                     };
+                    if from_source {
+                        scratch.sources[i] = ((chunk_index as u64) << RAW_EVENT_OFFSET_BITS)
+                            | ((tok.ekey >> 4) & RAW_EVENT_OFFSET_MAX);
+                    }
                     break;
                 }
                 let slot = &mut slots[i];
-                if slot.ekey == tok.ekey {
+                if slot.ekey == key && (!from_source || {
+                    let source = scratch.sources[i];
+                    let previous_chunk = (source >> RAW_EVENT_OFFSET_BITS) as usize;
+                    source_event_id(input[chunk_index].bytes, tok.ekey >> 4)
+                        == source_event_id(input[previous_chunk].bytes, source)
+                }) {
                     if ingest_rec(tok.ingest_s, tok.rec) < ingest_rec(slot.ingest_s, slot.rec) {
                         dead.mark(slot.rec); // no-op if the old winner is NONE
                         slot.ingest_s = tok.ingest_s;
@@ -891,6 +956,36 @@ fn dedup_stream(chunks: &[EvChunk], partition: usize, k: u32, scratch: &mut Dedu
         }
     }
     true
+}
+
+fn dedup_raw_sorted(chunks: &[EvChunk], input: &[Chunk<'_>], partition: usize, k: u32) {
+    let mut keys = Vec::new();
+    for (chunk_index, chunk) in chunks.iter().enumerate() {
+        let range = chunk.tok_off[partition] as usize..chunk.tok_off[partition + 1] as usize;
+        keys.extend(chunk.toks[range].iter().map(|tok| (tok, chunk_index)));
+    }
+    let group_cmp = |a: &(&Tok, usize), b: &(&Tok, usize)| {
+        routed_event_key(a.0.ekey).cmp(&routed_event_key(b.0.ekey)).then_with(|| {
+            if raw_event_id(a.0.ekey) {
+                source_event_id(input[a.1].bytes, a.0.ekey >> 4)
+                    .cmp(source_event_id(input[b.1].bytes, b.0.ekey >> 4))
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+    };
+    keys.sort_unstable_by(|a, b| group_cmp(a, b).then_with(|| {
+        ingest_rec(a.0.ingest_s, a.0.rec).cmp(&ingest_rec(b.0.ingest_s, b.0.rec))
+    }));
+    let dead = DeadView { chunks, k };
+    let mut winner = None;
+    for entry in keys {
+        if winner.as_ref().is_some_and(|first| group_cmp(first, &entry).is_eq()) {
+            dead.mark(entry.0.rec);
+        } else {
+            winner = Some(entry);
+        }
+    }
 }
 
 /// Streaming dedup with the sort path as a fallback for oversized partitions.
@@ -1697,6 +1792,8 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
             .and_then(|v| v.parse().ok())
             .unwrap_or(6),
     };
+    let raw_hex = ctx.parse_level == 6 && std::env::var_os("FAST_RAW_EVENT_HEX").as_deref()
+        != Some(std::ffi::OsStr::new("0"));
 
     // Tasks: (is_event, index), biggest chunks first so the tail is short.
     let mut tasks: Vec<(bool, usize, usize)> = event_chunks
@@ -1715,7 +1812,12 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         .with_max_len(1)
         .map(|&(is_event, i, _)| {
             if is_event {
-                Parsed::E(i, parse_event_chunk(&ctx, &event_chunks[i], i))
+                let chunk = if raw_hex {
+                    parse_event_chunk::<true>(&ctx, &event_chunks[i], i)
+                } else {
+                    parse_event_chunk::<false>(&ctx, &event_chunks[i], i)
+                };
+                Parsed::E(i, chunk)
             } else {
                 Parsed::C(i, parse_click_chunk(&ctx, &click_chunks[i]))
             }
@@ -1743,7 +1845,19 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     // --- D: dedup per event partition ---
     (0..parts.count())
         .into_par_iter()
-        .for_each(|partition| dedup_partition(&ev_chunks, partition, k));
+        .for_each(|partition| {
+            if raw_hex {
+                let handled = DEDUP_SCRATCH.with(|scratch| {
+                    dedup_stream_inner::<true>(&ev_chunks, &event_chunks, partition, k,
+                        &mut scratch.borrow_mut(), DEDUP_SCRATCH_BYTES)
+                });
+                if !handled {
+                    dedup_raw_sorted(&ev_chunks, &event_chunks, partition, k);
+                }
+            } else {
+                dedup_partition(&ev_chunks, partition, k);
+            }
+        });
     stages.mark("D dedup");
 
     // --- S: person stage, largest partitions first, dynamic queue ---
@@ -1921,6 +2035,110 @@ mod tests {
     }
     fn dead(chunks: &[EvChunk], chunk: usize, index: usize) -> bool {
         is_dead(&chunks[chunk].dead, index)
+    }
+
+    #[test]
+    fn raw_event_fingerprint_collisions_preserve_exact_winners_in_both_kernels() {
+        let raw_a = crate::hexid::render(b'e', 7);
+        let raw_b = crate::hexid::render(b'u', 7);
+        let mut bytes = raw_a.to_vec();
+        bytes.extend_from_slice(&raw_b);
+        let input = [Chunk { bytes: &bytes, has_header: false }; 2];
+        let key_a = (11 << (RAW_EVENT_OFFSET_BITS + 4)) | RAW_EVENT_TAG;
+        let key_b = key_a | ((raw_a.len() as u64) << 4);
+        for streaming in [true, false] {
+            let mut chunks = [chunk_with(1), chunk_with(2)];
+            chunks[0].toks = vec![
+                Tok { ekey: key_a, ingest_s: 1, rec: NONE },
+                Tok { ekey: key_b, ingest_s: 2, rec: rec(0, 0) },
+            ];
+            chunks[1].toks = vec![
+                Tok { ekey: key_a, ingest_s: 3, rec: rec(1, 0) },
+                Tok { ekey: key_b, ingest_s: 4, rec: rec(1, 1) },
+            ];
+            for chunk in &mut chunks {
+                chunk.tok_off = vec![0, 2];
+            }
+            if streaming {
+                assert!(dedup_stream_inner::<true>(
+                    &chunks, &input, 0, K, &mut DedupScratch::default(), DEDUP_SCRATCH_BYTES,
+                ));
+            } else {
+                dedup_raw_sorted(&chunks, &input, 0, K);
+            }
+            assert!(!dead(&chunks, 0, 0));
+            assert!(dead(&chunks, 1, 0));
+            assert!(dead(&chunks, 1, 1));
+        }
+    }
+
+    #[test]
+    fn raw_event_kernels_match_exact_oracle_with_collisions_and_epoch_wrap() {
+        let ids = IdInterner::new();
+        let mut rng = Rng(0x0e71_8501_1275_d4ac);
+        let mut scratch = DedupScratch::default();
+        for _ in 0..100 {
+            let mut input_bytes = Vec::new();
+            let mut raw = Vec::new();
+            let mut exact = Vec::new();
+            for chunk_index in 0..5 {
+                // The same normalized ID appears at different offsets and
+                // sometimes has a surrounding quote in the source.
+                let mut bytes = vec![b'\n'; chunk_index + 1];
+                let mut raw_chunk = chunk_with(85);
+                let mut exact_chunk = chunk_with(85);
+                for row in 0..85 {
+                    let number = rng.below(24);
+                    let prefix = if number % 2 == 0 { b'e' } else { b'u' };
+                    let rendered = crate::hexid::render(prefix, u128::from(number));
+                    let id: &[u8] = match number % 6 {
+                        0 => b"short-id",
+                        1 => b"E00000000000000000000000000000005",
+                        _ => &rendered,
+                    };
+                    let key = key_of(id, &ids);
+                    let raw_key = if crate::hexid::try_parse(id).is_some() {
+                        let quoted = rng.below(2) == 0;
+                        if quoted {
+                            bytes.push(b'"');
+                        }
+                        let offset = bytes.len() as u64;
+                        bytes.extend_from_slice(id);
+                        if quoted {
+                            bytes.push(b'"');
+                        }
+                        (u64::from(number % 3) << (RAW_EVENT_OFFSET_BITS + 4))
+                            | (offset << 4) | RAW_EVENT_TAG
+                    } else {
+                        key
+                    };
+                    let rec = if rng.below(5) == 0 { NONE } else { rec(chunk_index as u32, row) };
+                    let ingest_s = rng.below(90) as u32;
+                    let tok = Tok { ekey: key, ingest_s, rec };
+                    exact_chunk.toks.push(tok);
+                    raw_chunk.toks.push(Tok { ekey: raw_key, ..tok });
+                }
+                raw_chunk.tok_off = vec![0, 85];
+                exact_chunk.tok_off = vec![0, 85];
+                input_bytes.push(bytes);
+                raw.push(raw_chunk);
+                exact.push(exact_chunk);
+            }
+            let input: Vec<_> = input_bytes.iter()
+                .map(|bytes| Chunk { bytes, has_header: false })
+                .collect();
+            dedup_partition_sorted(&exact, 0, K);
+            let sorted = reset(&raw);
+            assert!(!dedup_stream_inner::<true>(&sorted, &input, 0, K, &mut scratch, 1));
+            assert!(dead_bits(&sorted).iter().flatten().all(|&word| word == 0));
+            dedup_raw_sorted(&sorted, &input, 0, K);
+            scratch.epoch = u32::MAX;
+            assert!(dedup_stream_inner::<true>(
+                &raw, &input, 0, K, &mut scratch, DEDUP_SCRATCH_BYTES,
+            ));
+            assert_eq!(dead_bits(&raw), dead_bits(&exact));
+            assert_eq!(dead_bits(&sorted), dead_bits(&exact));
+        }
     }
 
     #[test]
