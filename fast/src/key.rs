@@ -9,8 +9,8 @@
 //! favour of the shorter input.
 
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::hash::{hash_bytes, FastMap};
 
@@ -20,18 +20,32 @@ use crate::hash::{hash_bytes, FastMap};
 /// exact fallback and the upper 60 bits hold its index in [`IdInterner`].
 pub type IdKey = u64;
 
-const FALLBACK_SHARDS: usize = 64;
+/// log2 of the number of interner shards. 1024 shards keep lock contention
+/// negligible when 1 in 8 distinct IDs is a (33-byte, unpackable) fallback.
+const SHARD_BITS: u32 = 10;
+const FALLBACK_SHARDS: usize = 1 << SHARD_BITS;
+/// Shard-local indices must fit in the bits above the shard number of a u32.
+const MAX_LOCAL: u32 = 1 << (32 - SHARD_BITS);
+
+/// One shard: forward map (exact bytes -> local index) and reverse vector
+/// (local index -> bytes). Both are only ever touched under the shard mutex.
+#[derive(Default)]
+struct Shard {
+    map: FastMap<Arc<[u8]>, u32>,
+    rev: Vec<Arc<[u8]>>,
+}
 
 /// Concurrent, exact storage for IDs which [`pack`] cannot represent.
 ///
-/// The hash selects one of 64 mutexes, but equality inside a shard is always on
-/// the complete byte string. The reverse vector makes fallback keys reversible.
-/// Fallbacks are rare in generated data, so this favours simple correctness over
-/// a more complicated lock-free allocation scheme.
+/// The hash of the bytes selects one of 1024 shards; equality inside a shard is
+/// always on the complete byte string, so the hash never affects correctness.
+/// A fallback's global index is `(local << SHARD_BITS) | shard`, so reverse
+/// lookups decode the shard directly and lock only that shard. There is no
+/// global lock and no global counter on the insert path.
 pub struct IdInterner {
-    shards: [Mutex<FastMap<Arc<[u8]>, u32>>; FALLBACK_SHARDS],
-    bytes: Mutex<Vec<Option<Arc<[u8]>>>>,
-    next: AtomicU32,
+    shards: Box<[Mutex<Shard>]>,
+    /// Number of distinct fallbacks. Informational (tests only), Relaxed.
+    count: AtomicUsize,
 }
 
 impl Default for IdInterner {
@@ -40,73 +54,88 @@ impl Default for IdInterner {
     }
 }
 
+#[inline]
+fn encode_index(shard: usize, local: u32) -> u32 {
+    debug_assert!(shard < FALLBACK_SHARDS);
+    (local << SHARD_BITS) | shard as u32
+}
+
+#[inline]
+fn decode_index(index: u32) -> (usize, usize) {
+    (
+        (index as usize) & (FALLBACK_SHARDS - 1),
+        (index >> SHARD_BITS) as usize,
+    )
+}
+
 impl IdInterner {
     pub fn new() -> Self {
         Self {
-            shards: std::array::from_fn(|_| Mutex::new(FastMap::default())),
-            bytes: Mutex::new(Vec::new()),
-            next: AtomicU32::new(0),
+            shards: (0..FALLBACK_SHARDS)
+                .map(|_| Mutex::new(Shard::default()))
+                .collect(),
+            count: AtomicUsize::new(0),
         }
+    }
+
+    #[inline]
+    fn lock(&self, shard: usize) -> MutexGuard<'_, Shard> {
+        self.shards[shard]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn intern(&self, bytes: &[u8]) -> u32 {
-        let hash = hash_bytes(bytes);
-        let shard_index = (hash as usize) & (FALLBACK_SHARDS - 1);
-        let mut shard = self.shards[shard_index]
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(&index) = shard.get(bytes) {
-            return index;
+        // Top bits: the map's own hashing uses the low bits of a different
+        // (FastHasher-combined) value, but taking the top bits here keeps the
+        // shard choice independent of in-shard bucket choice regardless.
+        let shard_index = (hash_bytes(bytes) >> (64 - SHARD_BITS)) as usize;
+        let mut shard = self.lock(shard_index);
+        if let Some(&local) = shard.map.get(bytes) {
+            return encode_index(shard_index, local);
         }
 
-        let mut index = self.next.load(AtomicOrdering::Relaxed);
-        loop {
-            let next = index
-                .checked_add(1)
-                .unwrap_or_else(|| panic!("fallback ID interner exhausted u32 indices"));
-            match self.next.compare_exchange_weak(
-                index,
-                next,
-                AtomicOrdering::Relaxed,
-                AtomicOrdering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => index = actual,
-            }
-        }
+        let local = shard.rev.len() as u32;
+        assert!(
+            local < MAX_LOCAL,
+            "fallback ID interner shard {shard_index} exceeded {MAX_LOCAL} entries"
+        );
         let owned: Arc<[u8]> = Arc::from(bytes);
-        shard.insert(owned.clone(), index);
+        // Both the forward and reverse entries are installed under the same
+        // shard lock, so any index ever returned (to this or another thread)
+        // has its bytes visible to a later reader that locks this shard.
+        shard.rev.push(owned.clone());
+        shard.map.insert(owned, local);
+        drop(shard);
+        self.count.fetch_add(1, AtomicOrdering::Relaxed);
+        encode_index(shard_index, local)
+    }
 
-        // Keep the shard locked until the reverse entry is visible. A second
-        // thread interning the same bytes can therefore never observe a key
-        // whose reverse entry has not been installed yet.
-        let mut reverse = self
-            .bytes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if reverse.len() <= index as usize {
-            reverse.resize(index as usize + 1, None);
-        }
-        debug_assert!(reverse[index as usize].is_none());
-        reverse[index as usize] = Some(owned);
-        index
+    /// The interned bytes for `index` (shard lock held only for the clone).
+    #[inline]
+    fn get_arc(&self, index: u32) -> Arc<[u8]> {
+        let (shard, local) = decode_index(index);
+        let guard = self.lock(shard);
+        guard
+            .rev
+            .get(local)
+            .cloned()
+            .unwrap_or_else(|| panic!("fallback key has no interner entry: {index}"))
     }
 
     fn copy_bytes(&self, index: u32, out: &mut Vec<u8>) {
-        let reverse = self
-            .bytes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let bytes = reverse
-            .get(index as usize)
-            .and_then(Option::as_deref)
+        let (shard, local) = decode_index(index);
+        let guard = self.lock(shard);
+        let bytes = guard
+            .rev
+            .get(local)
             .unwrap_or_else(|| panic!("fallback key has no interner entry: {index}"));
         out.clear();
         out.extend_from_slice(bytes);
     }
 
     pub fn len(&self) -> usize {
-        self.next.load(AtomicOrdering::Relaxed) as usize
+        self.count.load(AtomicOrdering::Relaxed)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -142,11 +171,42 @@ pub fn key_bytes<'a>(key: IdKey, interner: &IdInterner, buf: &'a mut Vec<u8>) ->
     buf
 }
 
+/// The bytes of one key without heap allocation: packed keys unpack onto the
+/// stack, fallbacks share the interner's `Arc`.
+enum KeyBytes {
+    Packed([u8; 10], usize),
+    Fallback(Arc<[u8]>),
+}
+
+impl KeyBytes {
+    #[inline]
+    fn new(key: IdKey, interner: &IdInterner) -> Self {
+        let len = (key & 0x0f) as usize;
+        if len == 0 {
+            KeyBytes::Fallback(interner.get_arc((key >> 4) as u32))
+        } else {
+            assert!(len <= 10, "invalid packed ID length nibble: {len}");
+            let mut buf = [0; 10];
+            let written = unpack(key, &mut buf);
+            KeyBytes::Packed(buf, written)
+        }
+    }
+
+    #[inline]
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            KeyBytes::Packed(buf, len) => &buf[..*len],
+            KeyBytes::Fallback(bytes) => bytes,
+        }
+    }
+}
+
 /// Compare the underlying ID bytes exactly.
 ///
 /// Packing is order preserving, so the overwhelmingly common packed/packed
 /// case is one integer comparison. Any comparison involving a fallback
-/// materializes the real bytes and uses slice ordering.
+/// materializes the real bytes (stack or shared `Arc`, no allocation) and uses
+/// slice ordering.
 #[inline]
 pub fn key_cmp(a: IdKey, b: IdKey, interner: &IdInterner) -> Ordering {
     if a & 0x0f != 0 && b & 0x0f != 0 {
@@ -155,9 +215,9 @@ pub fn key_cmp(a: IdKey, b: IdKey, interner: &IdInterner) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }
-    let mut a_buf = Vec::new();
-    let mut b_buf = Vec::new();
-    key_bytes(a, interner, &mut a_buf).cmp(key_bytes(b, interner, &mut b_buf))
+    let a_bytes = KeyBytes::new(a, interner);
+    let b_bytes = KeyBytes::new(b, interner);
+    a_bytes.as_slice().cmp(b_bytes.as_slice())
 }
 
 const INVALID: u8 = 0xff;
@@ -583,6 +643,142 @@ mod tests {
                 }
                 dashes[pos] = b'-';
             }
+        }
+    }
+
+    /// One random ID: 33-char generator-style fallback, short packable, or
+    /// odd bytes (spaces, `\r`, non-UTF-8). Never empty.
+    fn random_id(rng: &mut XorShift64) -> Vec<u8> {
+        const HEX: &[u8] = b"0123456789abcdef";
+        const ODD: &[u8] = b"-0aZ_ \r\t,\"\x00\x7f\x80\xc3\xff";
+        match rng.next() % 5 {
+            0 | 1 => {
+                let mut id = vec![b"uec"[(rng.next() % 3) as usize]];
+                id.extend((0..32).map(|_| HEX[(rng.next() & 15) as usize]));
+                id
+            }
+            2 => {
+                let len = (rng.next() % 10 + 1) as usize;
+                (0..len).map(|_| ALPHABET[(rng.next() & 63) as usize]).collect()
+            }
+            3 => {
+                // Short hex-ish, often a prefix of a 33-char ID.
+                let len = (rng.next() % 6 + 1) as usize;
+                let mut id = vec![b"uec"[(rng.next() % 3) as usize]];
+                id.extend((1..len).map(|_| HEX[(rng.next() & 15) as usize]));
+                id
+            }
+            _ => {
+                let len = (rng.next() % 14 + 1) as usize;
+                (0..len).map(|_| ODD[rng.next() as usize % ODD.len()]).collect()
+            }
+        }
+    }
+
+    #[test]
+    fn concurrent_stress_overlapping_sets_are_exact() {
+        use std::collections::HashMap;
+        let mut rng = XorShift64(0x1234_5678_9abc_def1);
+        let universe: Vec<Vec<u8>> = (0..50_000).map(|_| random_id(&mut rng)).collect();
+        let interner = IdInterner::new();
+        let results: Vec<Vec<(usize, IdKey)>> = std::thread::scope(|scope| {
+            let joins: Vec<_> = (0..8u64)
+                .map(|t| {
+                    let universe = &universe;
+                    let interner = &interner;
+                    scope.spawn(move || {
+                        // Each thread visits an overlapping, shuffled subset.
+                        let mut rng = XorShift64(0x9e37_79b9_7f4a_7c15 ^ (t + 1) * 0x1000_0001);
+                        (0..50_000)
+                            .map(|_| {
+                                let i = rng.next() as usize % universe.len();
+                                (i, key_of(&universe[i], interner))
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            joins.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+
+        let mut key_by_bytes: HashMap<&[u8], IdKey> = HashMap::new();
+        let mut bytes_by_key: HashMap<IdKey, &[u8]> = HashMap::new();
+        let mut buf = Vec::new();
+        for (i, key) in results.into_iter().flatten() {
+            let bytes = universe[i].as_slice();
+            assert_eq!(*key_by_bytes.entry(bytes).or_insert(key), key, "same bytes, different keys: {bytes:?}");
+            assert_eq!(*bytes_by_key.entry(key).or_insert(bytes), bytes, "same key, different bytes");
+            assert_eq!(key_bytes(key, &interner, &mut buf), bytes);
+            assert_eq!(key & 0x0f == 0, pack(bytes).is_none());
+        }
+        let fallbacks = key_by_bytes.keys().filter(|b| pack(b).is_none()).count();
+        assert_eq!(interner.len(), fallbacks);
+        assert!(fallbacks > 10_000, "stress should exercise many fallbacks: {fallbacks}");
+        // Interning again on one thread returns the same keys.
+        for (bytes, &key) in &key_by_bytes {
+            assert_eq!(key_of(bytes, &interner), key);
+        }
+    }
+
+    #[test]
+    fn key_cmp_matches_bytes_for_packed_fallback_mixes() {
+        let interner = IdInterner::new();
+        let mut rng = XorShift64(0x0bad_cafe_dead_beef);
+        let mut pool: Vec<Vec<u8>> = (0..4_000).map(|_| random_id(&mut rng)).collect();
+        // Explicit prefix relations between fallbacks and packed keys.
+        let long = b"e0123456789abcdef0123456789abcdef".to_vec();
+        for cut in 1..=long.len() {
+            pool.push(long[..cut].to_vec());
+        }
+        pool.push(b"e123".to_vec());
+        pool.push(b"e123 ".to_vec());
+        pool.push(b"e1230000000000000000000000000000".to_vec());
+        let keys: Vec<IdKey> = pool.iter().map(|b| key_of(b, &interner)).collect();
+        // All pairs among the explicit tail, plus random pairs.
+        let tail = pool.len() - long.len() - 3;
+        for a in tail..pool.len() {
+            for b in tail..pool.len() {
+                assert_eq!(key_cmp(keys[a], keys[b], &interner), pool[a].cmp(&pool[b]));
+            }
+        }
+        for _ in 0..300_000 {
+            let a = rng.next() as usize % pool.len();
+            let b = rng.next() as usize % pool.len();
+            assert_eq!(
+                key_cmp(keys[a], keys[b], &interner),
+                pool[a].cmp(&pool[b]),
+                "{:?} vs {:?}",
+                pool[a],
+                pool[b]
+            );
+            assert_eq!(keys[a] == keys[b], pool[a] == pool[b]);
+        }
+    }
+
+    #[test]
+    fn fallback_index_encoding_round_trips() {
+        for shard in [0, 1, 7, FALLBACK_SHARDS - 2, FALLBACK_SHARDS - 1] {
+            for local in [0u32, 1, 2, 12_345, MAX_LOCAL - 1] {
+                let index = encode_index(shard, local);
+                assert_eq!(decode_index(index), (shard, local as usize));
+                let key = (index as u64) << 4;
+                assert_eq!(key & 0x0f, 0);
+                assert_eq!((key >> 4) as u32, index);
+            }
+        }
+        let interner = IdInterner::new();
+        let mut rng = XorShift64(0x5555_aaaa_1234_9876);
+        let mut buf = Vec::new();
+        for _ in 0..20_000 {
+            let id = random_id(&mut rng);
+            let key = key_of(&id, &interner);
+            if pack(&id).is_none() {
+                assert_eq!(key & 0x0f, 0);
+                let (shard, local) = decode_index((key >> 4) as u32);
+                assert!(shard < FALLBACK_SHARDS);
+                assert_eq!(&*interner.lock(shard).rev[local], id.as_slice());
+            }
+            assert_eq!(key_bytes(key, &interner, &mut buf), id.as_slice());
         }
     }
 
