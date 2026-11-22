@@ -30,7 +30,7 @@ FROM rust:1-slim-bookworm AS build
 RUN rustup component add llvm-tools-preview \
  || echo "PGO: warning: could not install llvm-tools-preview"
 
-# PGO training data: a 2M-event dataset from the official generator, with a
+# PGO training data: a 6M-event dataset from the official generator, with a
 # seed that is neither the dev set's (1) nor anything the scorer uses. The
 # generator has no dependencies, so it builds offline. It is built from /gen,
 # outside /src, so fast/.cargo/config.toml's CPU flags do not apply to it.
@@ -39,7 +39,7 @@ COPY generator/Cargo.toml generator/Cargo.lock /gen/
 COPY generator/src/ /gen/src/
 RUN cd /gen \
  && cargo build --release --locked --offline \
- && ./target/release/generate --seed 4242 --events 2000000 --clicks 500000 --output /pgo-data \
+ && ./target/release/generate --seed 4242 --events 6000000 --clicks 1500000 --output /pgo-data \
  || { echo "PGO: warning: generator failed; no training data"; rm -rf /pgo-data; }
 
 WORKDIR /src
