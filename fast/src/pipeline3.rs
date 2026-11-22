@@ -1215,6 +1215,8 @@ fn insertion_sort_by_key<T: Copy, K: Ord>(slice: &mut [T], key: impl Fn(&T) -> K
 /// Reusable per-worker buffers for the person stage.
 struct Scratch {
     evs: Vec<Ev>,
+    /// Ping-pong buffer for `radix_sort_evs_by_ts`.
+    ev_tmp: Vec<Ev>,
     cks: Vec<Ck>,
     sessions: Vec<Session>,
     starts: Vec<i64>,
@@ -1239,6 +1241,7 @@ impl Scratch {
     fn new(real_campaign_count: u32) -> Self {
         Self {
             evs: Vec::new(),
+            ev_tmp: Vec::new(),
             cks: Vec::new(),
             sessions: Vec::new(),
             starts: Vec::new(),
@@ -1255,6 +1258,119 @@ impl Scratch {
             phase: [0.0; 5],
         }
     }
+}
+
+/// Partitions with fewer live events than this keep the per-person sort: the
+/// radix pass's fixed histogram cost would dominate.
+const RADIX_MIN_EVENTS: usize = 64;
+
+/// `FAST_S_RADIX=0` selects the old per-person event sort; anything else (or
+/// unset) pre-sorts the partition's events by `ts_rel` with an LSD radix sort.
+fn s_radix_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FAST_S_RADIX").map_or(true, |v| v != "0"))
+}
+
+/// Stable LSD radix sort of `evs` by `ts_rel`: 3 digits of 11/11/10 bits.
+/// A digit that is constant across all keys is skipped (its pass would be the
+/// identity). `tmp` is a reusable ping-pong buffer; on return the sorted data
+/// is in `evs` (the two Vecs may have been swapped).
+fn radix_sort_evs_by_ts(evs: &mut Vec<Ev>, tmp: &mut Vec<Ev>) {
+    const BITS: u32 = 11;
+    const BUCKETS: usize = 1 << BITS;
+    const MASK: u32 = (BUCKETS - 1) as u32;
+    let n = evs.len();
+    if n < 2 {
+        return;
+    }
+    // One read pass builds all three histograms and the varying-bit mask.
+    let first = evs[0].ts_rel;
+    let mut diff = 0u32;
+    let mut hist = [[0u32; BUCKETS]; 3];
+    for e in evs.iter() {
+        let k = e.ts_rel;
+        diff |= k ^ first;
+        hist[0][(k & MASK) as usize] += 1;
+        hist[1][((k >> BITS) & MASK) as usize] += 1;
+        hist[2][(k >> (2 * BITS)) as usize] += 1; // top 10 bits
+    }
+    for (pass, counts) in hist.iter_mut().enumerate() {
+        let shift = BITS * pass as u32;
+        if (diff >> shift) & MASK == 0 {
+            continue; // every key has the same digit here
+        }
+        // Exclusive prefix sums: counts[b] becomes bucket b's write cursor.
+        let mut sum = 0u32;
+        for c in counts.iter_mut() {
+            let here = *c;
+            *c = sum;
+            sum += here;
+        }
+        tmp.clear();
+        tmp.reserve(n);
+        let slots = &mut tmp.spare_capacity_mut()[..n];
+        // Scatter in input order: equal digits keep their relative order, so
+        // the pass is stable and the LSD composition sorts by the full key.
+        for e in evs.iter() {
+            let at = &mut counts[((e.ts_rel >> shift) & MASK) as usize];
+            slots[*at as usize].write(*e);
+            *at += 1;
+        }
+        // SAFETY: the cursors partition 0..n and each wrote exactly its count,
+        // so all n slots were written.
+        unsafe { tmp.set_len(n) };
+        std::mem::swap(evs, tmp);
+    }
+}
+
+/// Group a gathered partition by person and order each person's records.
+///
+/// Group by person without a comparison sort over the whole partition: give
+/// each person with events a dense id (first-seen order) through a small
+/// L1/L2-resident hash table, counting-sort events and clicks by that id, then
+/// order each person's short slice by time. Clicks of persons with no events
+/// get no id and are dropped: they can credit or assist nothing.
+///
+/// With `radix`, the whole partition's events are first stably radix-sorted by
+/// `ts_rel`; `group_by_dense` is a stable scatter, so each person's event slice
+/// then comes out already in ts order and needs no per-person sort. This also
+/// changes the dense-id (first-seen) order, i.e. only the order of
+/// `index.persons` and hence of pushed rows: row order is free in the output
+/// and campaign_days are sums, so output is identical. Returns the instant the
+/// grouping (before per-person sorts) finished.
+fn group_partition(scratch: &mut Scratch, ids: &IdInterner, any_fallback_click: bool, radix: bool) -> Instant {
+    let Scratch { evs, ev_tmp, cks, index, dense, evs_by, ev_off, cks_by, ck_off, .. } = scratch;
+    if radix {
+        radix_sort_evs_by_ts(evs, ev_tmp);
+    }
+    index.reset(evs.len() / 16 + 8);
+    dense.clear();
+    dense.extend(evs.iter().map(|e| index.insert(e.person)));
+    let groups = index.persons.len();
+    group_by_dense(evs, dense, groups, evs_by, ev_off);
+    dense.clear();
+    dense.extend(cks.iter().map(|c| index.get(c.person)));
+    group_by_dense(cks, dense, groups, cks_by, ck_off);
+    let t_grouped = Instant::now();
+    for d in 0..groups {
+        if !radix {
+            // Events by ts. Order among equal-ts events cannot affect any
+            // output (they share a session; all aggregates are sums).
+            let slice = &mut evs_by[ev_off[d] as usize..ev_off[d + 1] as usize];
+            if slice.len() <= 24 {
+                insertion_sort_by_key(slice, |e| e.ts_rel);
+            } else {
+                slice.sort_unstable_by_key(|e| e.ts_rel);
+            }
+        }
+        // Clicks by (ts, click_id bytes): within an equal-ts run the first
+        // click has the byte-wise smallest click_id (rules Clicks 4).
+        let slice = &mut cks_by[ck_off[d] as usize..ck_off[d + 1] as usize];
+        if slice.len() > 1 {
+            sort_clicks(slice, ids, any_fallback_click);
+        }
+    }
+    t_grouped
 }
 
 struct PersonCtx<'a> {
@@ -1295,40 +1411,8 @@ fn process_partition<'a>(
         scratch.cks.extend_from_slice(&chunk.cks[lo..hi]);
     }
     let t_gathered = Instant::now();
-    // Group by person without a comparison sort over the whole partition:
-    // give each person with events a dense id (first-seen order) through a
-    // small L1/L2-resident hash table, counting-sort events and clicks by that
-    // id, then sort each person's short slice by time. Clicks of persons with
-    // no events get no id and are dropped: they can credit or assist nothing.
-    let t_grouped = {
-        let Scratch { evs, cks, index, dense, evs_by, ev_off, cks_by, ck_off, .. } = &mut *scratch;
-        index.reset(evs.len() / 16 + 8);
-        dense.clear();
-        dense.extend(evs.iter().map(|e| index.insert(e.person)));
-        let groups = index.persons.len();
-        group_by_dense(evs, dense, groups, evs_by, ev_off);
-        dense.clear();
-        dense.extend(cks.iter().map(|c| index.get(c.person)));
-        group_by_dense(cks, dense, groups, cks_by, ck_off);
-        let t_grouped = Instant::now();
-        for d in 0..groups {
-            // Events by ts. Order among equal-ts events cannot affect any
-            // output (they share a session; all aggregates are sums).
-            let slice = &mut evs_by[ev_off[d] as usize..ev_off[d + 1] as usize];
-            if slice.len() <= 24 {
-                insertion_sort_by_key(slice, |e| e.ts_rel);
-            } else {
-                slice.sort_unstable_by_key(|e| e.ts_rel);
-            }
-            // Clicks by (ts, click_id bytes): within an equal-ts run the first
-            // click has the byte-wise smallest click_id (rules Clicks 4).
-            let slice = &mut cks_by[ck_off[d] as usize..ck_off[d + 1] as usize];
-            if slice.len() > 1 {
-                sort_clicks(slice, ids, pc.any_fallback_click);
-            }
-        }
-        t_grouped
-    };
+    let radix = s_radix_enabled() && scratch.evs.len() >= RADIX_MIN_EVENTS;
+    let t_grouped = group_partition(scratch, ids, pc.any_fallback_click, radix);
     let t_sorted = Instant::now();
     scratch.phase[3] += (t_grouped - t_gathered).as_secs_f64();
     scratch.phase[4] += (t_sorted - t_grouped).as_secs_f64();
@@ -2145,6 +2229,82 @@ mod tests {
             .map(|c| (c.person, c.ts_rel, key_bytes(c.click, &ids, &mut Vec::new()).to_vec()))
             .collect();
         assert_eq!(got, expected);
+    }
+
+    /// Differential: radix pre-sort + stable grouping vs the old per-person
+    /// sort. For every person the event slice must be the same multiset and
+    /// sorted by ts_rel; the person set must match (dense order may differ).
+    #[test]
+    fn radix_grouping_matches_per_person_sort() {
+        let ids = IdInterner::new();
+        let mut rng = Rng(0x5eed_1234_abcd_0001);
+        let mut old = Scratch::new(0);
+        let mut new = Scratch::new(0);
+        for round in 0..300 {
+            let persons = 1 + rng.below(if round % 3 == 0 { 4 } else { 60 }) as usize;
+            // Timestamp regimes: full u32 range, narrow, tiny (many equal),
+            // and high-bits-only variation (low digits constant).
+            let regime = round % 4;
+            let mut evs = Vec::new();
+            for p in 0..persons {
+                let person = (p as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                let count = 1 + rng.below(200) as usize;
+                for _ in 0..count {
+                    let ts_rel = match regime {
+                        0 => rng.next() as u32,
+                        1 => 1_000_000 + rng.below(100_000) as u32,
+                        2 => 7 + rng.below(4) as u32,
+                        _ => (rng.below(8) as u32) << 25 | 0x00AB_CDEF,
+                    };
+                    evs.push(Ev { person, ts_rel, pc: rng.next() as u32 });
+                }
+            }
+            // Shuffle so persons interleave.
+            for i in (1..evs.len()).rev() {
+                evs.swap(i, rng.below(i as u64 + 1) as usize);
+            }
+            old.evs.clone_from(&evs);
+            old.cks.clear();
+            new.evs.clone_from(&evs);
+            new.cks.clear();
+            group_partition(&mut old, &ids, false, false);
+            group_partition(&mut new, &ids, false, true);
+            assert_eq!(old.index.persons.len(), new.index.persons.len());
+            let by_person = |s: &Scratch| -> std::collections::HashMap<IdKey, Vec<Ev>> {
+                s.index
+                    .persons
+                    .iter()
+                    .enumerate()
+                    .map(|(d, &p)| (p, s.evs_by[s.ev_off[d] as usize..s.ev_off[d + 1] as usize].to_vec()))
+                    .collect()
+            };
+            let (a, b) = (by_person(&old), by_person(&new));
+            for (person, old_slice) in &a {
+                let new_slice = &b[person];
+                assert!(new_slice.windows(2).all(|w| w[0].ts_rel <= w[1].ts_rel), "round {round}: not sorted");
+                assert!(old_slice.windows(2).all(|w| w[0].ts_rel <= w[1].ts_rel));
+                let key = |e: &Ev| (e.ts_rel, e.pc, e.person);
+                let mut x: Vec<_> = old_slice.iter().map(key).collect();
+                let mut y: Vec<_> = new_slice.iter().map(key).collect();
+                x.sort_unstable();
+                y.sort_unstable();
+                assert_eq!(x, y, "round {round}: multiset differs");
+            }
+        }
+    }
+
+    #[test]
+    fn radix_sort_evs_is_stable_and_sorted() {
+        let mut rng = Rng(0x0dd_ba11);
+        let mut tmp = Vec::new();
+        for n in [0usize, 1, 2, 3, 64, 1000, 5000] {
+            let mut evs: Vec<Ev> =
+                (0..n).map(|i| Ev { person: 0, ts_rel: (rng.next() as u32) % 97 * 0x0101_0101, pc: i as u32 }).collect();
+            let mut expected = evs.clone();
+            expected.sort_by_key(|e| e.ts_rel); // stable
+            radix_sort_evs_by_ts(&mut evs, &mut tmp);
+            assert_eq!(evs, expected);
+        }
     }
 
     #[test]

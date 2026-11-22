@@ -95,11 +95,20 @@ fn slot_of(b: &[u8]) -> usize {
 pub struct DateCache {
     window: (i64, i64),
     table: Box<[DateEntry; SLOTS]>,
+    /// Which common-form fast path `parse_ts_with` tries before the exact path:
+    /// 0 none (exact path only), 1 branchless [`parse_common`], 2 branchy
+    /// [`parse_common_br`]. Every mode gives identical results (each fast path only
+    /// returns values the exact path agrees with); it only changes speed. Chosen by
+    /// `FAST_TS_COMMON` at `set_window_hint` time, default 2. Profiling knob for x86 A/B.
+    mode: u8,
 }
 
 /// Upper bound on the number of days a cache will cover, so a silly manifest window
 /// cannot make building it expensive. Days beyond it just miss.
 const MAX_CACHE_DAYS: i64 = 4096;
+
+/// Default `DateCache::mode` (see there).
+const TS_MODE_DEFAULT: u8 = 2;
 
 impl DateCache {
     /// Cache covering every date in `[window_start - 8 days, window_end + 7 days]`.
@@ -133,6 +142,7 @@ impl DateCache {
         DateCache {
             window: (window_start_ms, window_end_ms),
             table,
+            mode: TS_MODE_DEFAULT,
         }
     }
 
@@ -164,9 +174,15 @@ pub fn set_window_hint(window_start_ms: i64, window_end_ms: i64) {
     let cur = DATE_CACHE.load(Ordering::Acquire);
     // SAFETY: non-null pointers in DATE_CACHE come from Box::into_raw and are never freed.
     if !cur.is_null() && unsafe { (*cur).window } == (window_start_ms, window_end_ms) {
+        // (The mode was read from FAST_TS_COMMON when this cache was installed.)
         return;
     }
-    let cache = Box::new(DateCache::for_window(window_start_ms, window_end_ms));
+    let mut cache = Box::new(DateCache::for_window(window_start_ms, window_end_ms));
+    cache.mode = match std::env::var("FAST_TS_COMMON").as_deref() {
+        Ok("0") => 0,
+        Ok("1") => 1,
+        _ => TS_MODE_DEFAULT,
+    };
     DATE_CACHE.store(Box::into_raw(cache), Ordering::Release);
 }
 
@@ -197,8 +213,176 @@ pub fn parse_ts(b: &[u8]) -> Option<i64> {
     parse_ts_with(current_cache(), b)
 }
 
+/// `parse_ts` with an explicit cache: first the branch-light common-form path
+/// [`parse_common`], and on anything it does not fully accept, the exact path
+/// [`parse_ts_exact_with`]. `parse_common` only ever returns `Some(v)` where the exact
+/// path returns the same `Some(v)`, so the result is identical on every input.
 #[inline(always)]
 fn parse_ts_with(cache: Option<&DateCache>, b: &[u8]) -> Option<i64> {
+    if let Some(c) = cache {
+        let fast = match c.mode {
+            2 => parse_common_br(c, b),
+            1 => parse_common(c, b),
+            _ => None,
+        };
+        if let Some(v) = fast {
+            return Some(v);
+        }
+    }
+    parse_ts_exact_with(cache, b)
+}
+
+#[inline(always)]
+fn load8(b: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(b[i..i + 8].try_into().unwrap())
+}
+
+/// `x` holds 8 bytes already XORed with ASCII `0` (so a digit byte is its value): true
+/// iff every byte is 0..=9 (see `swar_hms` for why this test is exact).
+#[inline(always)]
+fn swar_all_le9(x: u64) -> bool {
+    ((x.wrapping_add(0x7676_7676_7676_7676) | x) & 0x8080_8080_8080_8080) == 0
+}
+
+/// 8 digit values (most significant in the lowest byte, each 0..=9) -> their number.
+/// Same lane-combining as `parse_epoch_millis_swar`.
+#[inline(always)]
+fn swar_value8(x: u64) -> i64 {
+    let x = x.wrapping_mul(10).wrapping_add(x >> 8) & 0x00FF_00FF_00FF_00FF;
+    let x = x.wrapping_mul(100).wrapping_add(x >> 16) & 0x0000_FFFF_0000_FFFF;
+    let x = x.wrapping_mul(10_000).wrapping_add(x >> 32) & 0x0000_0000_FFFF_FFFF;
+    x as i64
+}
+
+/// Branch-light accept-only path for the three forms the data is made of: F1 (len 20)
+/// and F2 (len 25) whose date is in the window cache, and F3 of exactly 13 digits.
+///
+/// Why: the form mix is random per line (F1 ~58%, F2 10%, F3 ~32%), so the length
+/// dispatch in the exact path mispredicts on a large share of lines. Here all three
+/// candidates are computed unconditionally from in-bounds loads (every load is valid
+/// for any `len >= 13`; for the "wrong" form it just reads irrelevant bytes) and one
+/// is selected with plain boolean `&`/`|` logic, so the only data-dependent branch left
+/// is "was any form fully accepted", which is ~99% taken.
+///
+/// Contract: returns `Some(v)` only when the exact path (`parse_ts_exact_with` with
+/// this cache, equivalently `parse_ts_uncached`) returns `Some(v)`. It returns `None`
+/// for everything else — including perfectly valid values of other shapes (F3 of other
+/// lengths, uncached dates) — and the caller then runs the exact path. So a `None` here
+/// means "undecided", never "invalid".
+#[inline(always)]
+fn parse_common(cache: &DateCache, b: &[u8]) -> Option<i64> {
+    let len = b.len();
+    if len < 13 {
+        return None;
+    }
+    const ZEROS: u64 = 0x3030_3030_3030_3030;
+    let first = load8(b, 0); // b[0..8]
+    let last = load8(b, len - 8); // b[len-8..len]
+
+    // ---- F3, exactly 13 ASCII digits: b[0..5] then b[5..13].
+    let xf = first ^ ZEROS;
+    let xl = last ^ ZEROS;
+    // `xf << 24` keeps digits b[0..5] and moves them up 3 bytes, filling the low
+    // (most significant) bytes with digit value 0: the 8-digit number 000ddddd.
+    // b[5..8] are dropped here but are checked as part of `xl` (b[5..13]).
+    let f3_ok = (len == 13) & swar_all_le9(xf) & swar_all_le9(xl);
+    let f3_val = swar_value8(xf << 24) * 100_000_000 + swar_value8(xl);
+
+    // ---- F1/F2 civil part `yyyy-mm-ddThh:mi:ss` (meaningful only for len 20/25).
+    // Date: exact 10-byte match against the window cache (same as `cached_civil`,
+    // including the byte-7 `-` guard that keeps empty slots from matching).
+    let e = &cache.table[slot_of(b)];
+    let k2 = u16::from_le_bytes([b[8], b[9]]);
+    let date_ok = (e.k8 == first) & (e.k2 == k2) & ((first >> 56) as u8 == b'-');
+    let t_ok = b[10] == b'T';
+    // hh:mi:ss at b[11..19]; for len 13 the offset is clamped to stay in bounds (the
+    // result is then unused because neither len==20 nor len==25 holds).
+    let hv = load8(b, (len - 8).min(11)) ^ u64::from_le_bytes(*b"00:00:00");
+    let hd = |i: u32| ((hv >> (8 * i)) & 0xFF) as i64;
+    let hour = hd(0) * 10 + hd(1);
+    let min = hd(3) * 10 + hd(4);
+    let sec = hd(6) * 10 + hd(7);
+    let hms_ok = swar_all_le9(hv)
+        & (hv & 0x0000_FF00_00FF_0000 == 0)
+        & (hour <= 23)
+        & (min <= 59)
+        & (sec <= 59);
+    let civ_ok = date_ok & t_ok & hms_ok;
+    let civ = (e.days as i64) * MS_PER_DAY + hour * MS_PER_HOUR + min * MS_PER_MIN + sec * MS_PER_SEC;
+
+    // ---- Zone byte b[19] (clamped in-bounds for len 13; unused there).
+    let z = b[(len - 1).min(19)];
+    let f1_ok = (len == F1_LEN) & (z == b'Z') & civ_ok;
+
+    // ---- F2 offset: for len 25, `last` = b[17..25] = `ss` `±` `oh` `:` `om`
+    // (bytes 0..8 of `last`). Mask out the sign byte (2), XOR the rest against
+    // `00?00:00`: bytes 0,1,3,4,6,7 must be digits, byte 5 must be exactly `:`.
+    let ov = (last ^ u64::from_le_bytes(*b"00\x0000:00")) & !0x0000_0000_00FF_0000u64;
+    let od = |i: u32| ((ov >> (8 * i)) & 0xFF) as i64;
+    let oh = od(3) * 10 + od(4);
+    let om = od(6) * 10 + od(7);
+    let off_ok = swar_all_le9(ov) & ((ov >> 40) & 0xFF == 0) & (oh <= 23) & (om <= 59);
+    let off = oh * MS_PER_HOUR + om * MS_PER_MIN;
+    // "subtract it to get UTC": `+` subtracts, `-` adds. (z == b[19] == sign for len 25.)
+    let f2_val = if z == b'-' { civ + off } else { civ - off };
+    let f2_ok = (len == F2_LEN) & ((z == b'+') | (z == b'-')) & civ_ok & off_ok;
+
+    let v = if f3_ok { f3_val } else if f1_ok { civ } else { f2_val };
+    if f3_ok | f1_ok | f2_ok {
+        Some(v)
+    } else {
+        None
+    }
+}
+
+/// Branchy variant of [`parse_common`], same contract (`Some(v)` only where the exact
+/// path gives `Some(v)`; `None` = undecided). Dispatches on length like the exact path
+/// but with tighter per-form code: F3 of exactly 13 digits as two overlapping 8-byte
+/// SWAR loads (b[0..8], b[5..13]) instead of 8 + a 5-iteration byte loop, and the F2
+/// offset `ss±oh:om` (b[17..25]) validated in one u64 instead of four byte checks.
+/// The default mode: on the Mac it measured faster than both the exact path and the
+/// branchless `parse_common` (not evidence for x86; see `FAST_TS_COMMON`).
+#[inline(always)]
+fn parse_common_br(cache: &DateCache, b: &[u8]) -> Option<i64> {
+    const ZEROS: u64 = 0x3030_3030_3030_3030;
+    match b.len() {
+        13 => {
+            let xf = load8(b, 0) ^ ZEROS;
+            let xl = load8(b, 5) ^ ZEROS;
+            if !(swar_all_le9(xf) & swar_all_le9(xl)) {
+                return None;
+            }
+            Some(swar_value8(xf << 24) * 100_000_000 + swar_value8(xl))
+        }
+        F1_LEN => {
+            if b[19] != b'Z' {
+                return None;
+            }
+            cached_civil(Some(cache), b)?
+        }
+        F2_LEN => {
+            if b[19] != b'+' && b[19] != b'-' {
+                return None;
+            }
+            let ms = cached_civil(Some(cache), b)??;
+            let ov = (load8(b, 17) ^ u64::from_le_bytes(*b"00\x0000:00")) & !0x0000_0000_00FF_0000u64;
+            let od = |i: u32| ((ov >> (8 * i)) & 0xFF) as i64;
+            let oh = od(3) * 10 + od(4);
+            let om = od(6) * 10 + od(7);
+            if !(swar_all_le9(ov) & ((ov >> 40) & 0xFF == 0) & (oh <= 23) & (om <= 59)) {
+                return None;
+            }
+            let off = oh * MS_PER_HOUR + om * MS_PER_MIN;
+            Some(if b[19] == b'-' { ms + off } else { ms - off })
+        }
+        _ => None,
+    }
+}
+
+/// The exact (pre-`parse_common`) parser with an explicit cache: identical to
+/// `parse_ts_uncached` on every input.
+#[inline(always)]
+fn parse_ts_exact_with(cache: Option<&DateCache>, b: &[u8]) -> Option<i64> {
     match b.len() {
         F1_LEN if b[19] == b'Z' => match cached_civil(cache, b) {
             Some(r) => r,
@@ -1298,6 +1482,15 @@ mod tests {
     }
 
     fn assert_same(cache: Option<&DateCache>, b: &[u8]) {
+        if let Some(c) = cache {
+            let exact = parse_ts_uncached(b);
+            assert_eq!(parse_ts_exact_with(cache, b), exact, "exact path on {:?}", b);
+            for (name, fast) in [("branchless", parse_common(c, b)), ("branchy", parse_common_br(c, b))] {
+                if fast.is_some() {
+                    assert_eq!(fast, exact, "{name} fast path on {:?} ({:?})", String::from_utf8_lossy(b), b);
+                }
+            }
+        }
         assert_eq!(
             parse_ts_with(cache, b),
             parse_ts_uncached(b),
@@ -1683,6 +1876,7 @@ mod tests {
                     }
                 }
             }
+            assert_same(Some(c), &s);
             let got = parse_ts_with(Some(c), &s);
             assert_eq!(
                 got,
@@ -1716,5 +1910,213 @@ mod tests {
         }
         assert_eq!(parse_ts(b"2028-02-29T12:00:00Z"), Some(ms("2028-02-29T12:00:00Z")));
         assert_eq!(parse_ts(b"2027-02-29T12:00:00Z"), None);
+    }
+
+    /// Real `ts` fields (quotes stripped) from the d20 data set, if present locally.
+    fn real_ts_fields(max_lines_per_file: usize, files: usize) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let Some(home) = std::env::var_os("HOME") else { return out };
+        for kind in ["events", "clicks"] {
+            let dir = std::path::Path::new(&home).join("bt-data/d20").join(kind);
+            let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+            let mut paths: Vec<_> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            paths.sort();
+            let col = if kind == "events" { 2 } else { 3 };
+            for p in paths.into_iter().take(files) {
+                let Ok(data) = std::fs::read(&p) else { continue };
+                for line in data.split(|&c| c == b'\n').skip(1).take(max_lines_per_file) {
+                    if let Some(f) = line.split(|&c| c == b',').nth(col) {
+                        let f = if f.len() >= 2 && f[0] == b'"' && f[f.len() - 1] == b'"' {
+                            &f[1..f.len() - 1]
+                        } else {
+                            f
+                        };
+                        out.push(f.to_vec());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn d20_window() -> (i64, i64) {
+        // Read window from the manifest if present; otherwise a wide default.
+        let home = std::env::var("HOME").unwrap_or_default();
+        let m = std::fs::read_to_string(format!("{home}/bt-data/d20/manifest.json")).unwrap_or_default();
+        let grab = |k: &str| -> Option<i64> {
+            let i = m.find(k)? + k.len();
+            let rest = &m[i..];
+            let a = rest.find('"')? + 1;
+            let b = a + rest[a..].find('"')?;
+            parse_ts_uncached(rest[a..b].as_bytes())
+        };
+        match (grab("\"window_start\""), grab("\"window_end\"")) {
+            (Some(a), Some(b)) => (a, b),
+            _ => (ms("2027-12-01T00:00:00Z"), ms("2027-12-31T00:00:00Z")),
+        }
+    }
+
+    #[test]
+    fn differential_real_d20_ts_fields() {
+        let fields = real_ts_fields(200_000, 3);
+        if fields.is_empty() {
+            eprintln!("differential_real_d20_ts_fields: no local d20 data, skipped");
+            return;
+        }
+        let (ws, we) = d20_window();
+        let c = DateCache::for_window(ws, we);
+        let mut fast_hits = 0usize;
+        for f in &fields {
+            assert_same(Some(&c), f);
+            assert_eq!(parse_ts_exact_with(Some(&c), f), parse_ts_uncached(f));
+            if let Some(v) = parse_common(&c, f) {
+                assert_eq!(Some(v), parse_ts_uncached(f), "{:?}", String::from_utf8_lossy(f));
+                fast_hits += 1;
+            }
+        }
+        eprintln!("real d20 ts fields: {} compared, {} via parse_common", fields.len(), fast_hits);
+        assert!(fast_hits * 100 > fields.len() * 90, "fast path rarely hit: {fast_hits}");
+    }
+
+    #[test]
+    #[ignore]
+    fn ts_cost_probe_real() {
+        let fields = real_ts_fields(400_000, 4);
+        let (ws, we) = d20_window();
+        let c = DateCache::for_window(ws, we);
+        for round in 0..3 {
+            let t = std::time::Instant::now();
+            let mut acc = 0i64;
+            for f in &fields {
+                acc = acc.wrapping_add(std::hint::black_box(parse_ts_exact_with(Some(&c), std::hint::black_box(f))).unwrap_or(1));
+            }
+            let e = t.elapsed().as_nanos() as f64 / fields.len() as f64;
+            let t = std::time::Instant::now();
+            let mut acc2 = 0i64;
+            for f in &fields {
+                acc2 = acc2.wrapping_add(std::hint::black_box(parse_ts_with(Some(&c), std::hint::black_box(f))).unwrap_or(1));
+            }
+            let n = t.elapsed().as_nanos() as f64 / fields.len() as f64;
+            let t = std::time::Instant::now();
+            let mut acc3 = 0i64;
+            for f in &fields {
+                let f = std::hint::black_box(f);
+                let r = match parse_common_br(&c, f) { Some(v) => Some(v), None => parse_ts_exact_with(Some(&c), f) };
+                acc3 = acc3.wrapping_add(std::hint::black_box(r).unwrap_or(1));
+            }
+            let br = t.elapsed().as_nanos() as f64 / fields.len() as f64;
+            eprintln!("  branchy-common {br:.2}");
+            assert_eq!(acc, acc3);
+            assert_eq!(acc, acc2);
+            eprintln!("round {round}: exact {e:.2} ns/call, new {n:.2} ns/call ({} fields)", fields.len());
+        }
+    }
+
+
+    fn caches_all_modes(ws: i64, we: i64) -> Vec<DateCache> {
+        (0..=2u8)
+            .map(|m| {
+                let mut c = DateCache::for_window(ws, we);
+                c.mode = m;
+                c
+            })
+            .collect()
+    }
+
+    #[test]
+    fn common_paths_f3_every_length_and_byte() {
+        let (ws, we) = (ms("2027-12-11T00:00:00Z"), ms("2027-12-25T00:00:00Z"));
+        let caches = caches_all_modes(ws, we);
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        for len in 1..=20usize {
+            for _ in 0..2000 {
+                let mut v: Vec<u8> = (0..len).map(|_| b'0' + rng.below(10) as u8).collect();
+                match rng.below(6) {
+                    0 => {
+                        // leading zeros
+                        let z = rng.below(len as u64 + 1) as usize;
+                        for x in v.iter_mut().take(z) {
+                            *x = b'0';
+                        }
+                    }
+                    1 => v[0] = if rng.below(2) == 0 { b'-' } else { b'+' },
+                    2 => {
+                        let i = rng.below(len as u64) as usize;
+                        v[i] = rng.next() as u8;
+                    }
+                    _ => {}
+                }
+                for c in &caches {
+                    assert_eq!(parse_ts_with(Some(c), &v), parse_ts_uncached(&v), "{:?}", v);
+                }
+                assert_same(Some(&caches[0]), &v);
+            }
+        }
+        // Every byte value at every position of a 13-digit value, and of real-looking ones.
+        for base in [&b"1829168499000"[..], b"0000000000000", b"9999999999999", b"0001829168499"] {
+            for i in 0..13 {
+                for byte in 0..=255u8 {
+                    let mut v = base.to_vec();
+                    v[i] = byte;
+                    assert_same(Some(&caches[0]), &v);
+                    for c in &caches {
+                        assert_eq!(parse_ts_with(Some(c), &v), parse_ts_uncached(&v));
+                    }
+                }
+            }
+        }
+        assert_eq!(parse_common_br(&caches[0], b"1829168499000"), Some(1_829_168_499_000));
+        assert_eq!(parse_common(&caches[0], b"0000000000001"), Some(1));
+        assert_eq!(parse_common_br(&caches[0], b"9999999999999"), Some(9_999_999_999_999));
+    }
+
+    #[test]
+    fn common_paths_iso_every_byte_and_variants() {
+        let (ws, we) = (ms("2028-02-20T00:00:00Z"), ms("2028-03-05T00:00:00Z"));
+        let caches = caches_all_modes(ws, we);
+        let bases = [
+            "2028-02-29T00:00:00Z", "2028-02-29T23:59:59Z", "2028-02-28T12:00:00-02:00",
+            "2028-02-29T00:14:48+12:00", "2028-03-01T00:00:00-10:00", "2028-02-29T00:00:00-00:00",
+            "2028-02-29T23:59:59+23:59", "2028-02-29T00:00:00.000Z", "2028-02-29T00:00:00.5Z",
+            "2028-02-29T00:00:00+0200", "2028-02-29 00:00:00Z", "2028-02-29T00:00:00z",
+            "2028-02-29t00:00:00Z", "2028-02-29T00:00:00", "2028-02-30T00:00:00Z",
+            "2027-02-29T00:00:00Z", "2028-13-01T00:00:00Z", "2028-02-29T24:00:00Z",
+            "2028-02-29T00:60:00Z", "2028-02-29T00:00:60Z", "2028-02-29T00:00:00+24:00",
+            "2028-02-29T00:00:00+05:60", "2028-02-29T00:00:00Z\r", " 2028-02-29T00:00:00Z",
+            "2028-02-29T00:00:00Z ", "2028-02-29T00:00:00+02:00\r",
+        ];
+        for base in bases {
+            let bb = base.as_bytes();
+            assert_same(Some(&caches[0]), bb);
+            for c in &caches {
+                assert_eq!(parse_ts_with(Some(c), bb), parse_ts_uncached(bb), "{base}");
+            }
+            for i in 0..bb.len() {
+                for byte in 0..=255u8 {
+                    let mut v = bb.to_vec();
+                    v[i] = byte;
+                    assert_same(Some(&caches[0]), &v);
+                    for c in &caches {
+                        assert_eq!(parse_ts_with(Some(c), &v), parse_ts_uncached(&v));
+                    }
+                }
+            }
+        }
+        // The fast paths must actually accept the common forms.
+        for f in [&b"2028-02-29T00:00:00Z"[..], b"2028-02-29T00:00:00-02:00"] {
+            assert!(parse_common(&caches[0], f).is_some());
+            assert!(parse_common_br(&caches[0], f).is_some());
+        }
+    }
+
+    #[test]
+    fn real_d20_fields_every_mode() {
+        let fields = real_ts_fields(200_000, 3);
+        let (ws, we) = d20_window();
+        for c in caches_all_modes(ws, we) {
+            for f in &fields {
+                assert_eq!(parse_ts_with(Some(&c), f), parse_ts_uncached(f), "{:?}", f);
+            }
+        }
     }
 }
