@@ -1809,21 +1809,26 @@ impl DenseIndex {
     }
 
     #[inline(always)]
-    fn slot_of(&self, key: IdKey) -> usize {
-        // Salted differently from the partition hash, whose top bits are
-        // equal for every key in this partition.
-        fmix64(key ^ 0x6465_6e73_655f_7633) as usize & self.mask
+    fn slot_of<const FOLDED: bool>(&self, key: IdKey) -> usize {
+        // Partitions use high hash bits. Local probing uses low bits and
+        // compares the complete person key before accepting a match.
+        let hash = if FOLDED {
+            alias_hash(key)
+        } else {
+            fmix64(key ^ 0x6465_6e73_655f_7633)
+        };
+        hash as usize & self.mask
     }
 
     #[inline]
-    fn insert(&mut self, key: IdKey) -> u32 {
-        let mut slot = self.slot_of(key);
+    fn insert<const FOLDED: bool>(&mut self, key: IdKey) -> u32 {
+        let mut slot = self.slot_of::<FOLDED>(key);
         loop {
             let (k, v) = self.slots[slot];
             if v == NO_PERSON {
                 if (self.persons.len() + 1) * 2 > self.slots.len() {
-                    self.grow();
-                    return self.insert(key);
+                    self.grow::<FOLDED>();
+                    return self.insert::<FOLDED>(key);
                 }
                 let dense = self.persons.len() as u32;
                 self.slots[slot] = (key, dense);
@@ -1838,8 +1843,8 @@ impl DenseIndex {
     }
 
     #[inline]
-    fn get(&self, key: IdKey) -> u32 {
-        let mut slot = self.slot_of(key);
+    fn get<const FOLDED: bool>(&self, key: IdKey) -> u32 {
+        let mut slot = self.slot_of::<FOLDED>(key);
         loop {
             let (k, v) = self.slots[slot];
             if v == NO_PERSON || k == key {
@@ -1849,13 +1854,13 @@ impl DenseIndex {
         }
     }
 
-    fn grow(&mut self) {
+    fn grow<const FOLDED: bool>(&mut self) {
         let cap = self.slots.len() * 2;
         self.slots.clear();
         self.slots.resize(cap, (0, NO_PERSON));
         self.mask = cap - 1;
         for (dense, &key) in self.persons.iter().enumerate() {
-            let mut slot = self.slot_of(key);
+            let mut slot = self.slot_of::<FOLDED>(key);
             while self.slots[slot].1 != NO_PERSON {
                 slot = (slot + 1) & self.mask;
             }
@@ -2054,17 +2059,30 @@ enum ClickIds<'a> {
 /// and campaign_days are sums, so output is identical. Returns the instant the
 /// grouping (before per-person sorts) finished.
 fn group_partition(scratch: &mut Scratch, click_ids: ClickIds<'_>, radix: bool) -> Instant {
+    static FOLDED: OnceLock<bool> = OnceLock::new();
+    if *FOLDED.get_or_init(|| std::env::var_os("FAST_DENSE_HASH").as_deref() != Some(std::ffi::OsStr::new("0"))) {
+        group_partition_with_hash::<true>(scratch, click_ids, radix)
+    } else {
+        group_partition_with_hash::<false>(scratch, click_ids, radix)
+    }
+}
+
+fn group_partition_with_hash<const FOLDED: bool>(
+    scratch: &mut Scratch,
+    click_ids: ClickIds<'_>,
+    radix: bool,
+) -> Instant {
     let Scratch { evs, ev_tmp, cks, index, dense, evs_by, ev_off, cks_by, ck_off, .. } = scratch;
     if radix {
         radix_sort_evs_by_ts(evs, ev_tmp);
     }
     index.reset(evs.len() / 16 + 8);
     dense.clear();
-    dense.extend(evs.iter().map(|e| index.insert(e.person)));
+    dense.extend(evs.iter().map(|e| index.insert::<FOLDED>(e.person)));
     let groups = index.persons.len();
     group_by_dense(evs, dense, groups, evs_by, ev_off);
     dense.clear();
-    dense.extend(cks.iter().map(|c| index.get(c.person)));
+    dense.extend(cks.iter().map(|c| index.get::<FOLDED>(c.person)));
     group_by_dense(cks, dense, groups, cks_by, ck_off);
     let t_grouped = Instant::now();
     for d in 0..groups {
@@ -4670,12 +4688,17 @@ empty,\"\",c1,2026-10-01T00:00:00Z",
 
     #[test]
     fn group_by_dense_is_stable_and_drops_unindexed() {
+        check_dense_grouping::<false>();
+        check_dense_grouping::<true>();
+    }
+
+    fn check_dense_grouping<const FOLDED: bool>() {
         let mut index = DenseIndex::default();
         index.reset(1);
         let persons: Vec<IdKey> = (0..500u64).map(|i| (i % 37).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1).collect();
-        let dense: Vec<u32> = persons.iter().map(|&p| index.insert(p)).collect();
+        let dense: Vec<u32> = persons.iter().map(|&p| index.insert::<FOLDED>(p)).collect();
         assert_eq!(index.persons.len(), 37);
-        assert_eq!(index.get(12345 << 4), NO_PERSON);
+        assert_eq!(index.get::<FOLDED>(12345 << 4), NO_PERSON);
         let mut ids = dense.clone();
         ids[3] = NO_PERSON; // dropped
         let items: Vec<u32> = (0..500).collect();
