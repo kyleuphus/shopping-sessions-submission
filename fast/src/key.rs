@@ -91,9 +91,8 @@ impl IdInterner {
         Self::with_hex_log2(HEX_LOG2_SLOTS)
     }
 
-    /// Like [`new`](Self::new) with a `2^log2` slot hex table (tests force
-    /// overflow into the shards with a tiny table).
-    fn with_hex_log2(log2: u32) -> Self {
+    /// Use a `2^log2` slot hex table. Full regions retain the exact fallback.
+    pub(crate) fn with_hex_log2(log2: u32) -> Self {
         Self {
             hex: HexTable::new(log2),
             shards: (0..FALLBACK_SHARDS)

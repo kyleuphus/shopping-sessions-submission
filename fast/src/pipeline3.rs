@@ -144,6 +144,7 @@ impl Ev {
 #[repr(C)]
 struct Ck {
     person: IdKey,
+    /// An interned key or a (chunk, byte offset) reference, selected for the run.
     click: IdKey,
     ts_rel: u32,
     camp: u16,
@@ -673,7 +674,7 @@ fn resolve_persons<T>(ctx: &Ctx<'_>, records: &mut [T], person: impl Fn(&mut T) 
     tags
 }
 
-fn parse_click_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>) -> CkChunk {
+fn parse_click_chunk<const SOURCE_IDS: bool>(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> CkChunk {
     let parts = ctx.parts;
     let level = ctx.parse_level;
     let click_start = ctx.base;
@@ -713,13 +714,22 @@ fn parse_click_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>) -> CkChunk {
             return;
         }
         let user = key_of(user, ctx.ids);
-        let click = key_of(click_id, ctx.ids);
+        let click = if SOURCE_IDS {
+            // The scanner returns a nonempty subslice of this chunk. The driver
+            // checks the chunk count and byte lengths before enabling source IDs.
+            let offset = click_id.as_ptr() as usize - chunk.bytes.as_ptr() as usize;
+            (chunk_id as u64) << 32 | offset as u64
+        } else {
+            key_of(click_id, ctx.ids)
+        };
         if level < 5 {
             std::hint::black_box((user, click));
             return;
         }
         // A fallback key has length nibble 0 (key.rs).
-        has_fallback_click |= click & 0x0f == 0;
+        if !SOURCE_IDS {
+            has_fallback_click |= click & 0x0f == 0;
+        }
         cks.push(Ck {
             person: user, // resolved after the line loop (resolve_persons)
             click,
@@ -1178,6 +1188,44 @@ fn sort_clicks(cks: &mut [Ck], ids: &IdInterner, any_fallback: bool) {
     }
 }
 
+fn click_source_id<'a>(reference: u64, chunks: &[Chunk<'a>]) -> &'a [u8] {
+    let chunk = &chunks[(reference >> 32) as usize];
+    let rest = &chunk.bytes[reference as u32 as usize..];
+    let comma = memchr::memchr(b',', rest).expect("a parsed click ID precedes a comma");
+    let id = &rest[..comma];
+    // The offset already skips the opening quote. A valid field can have a
+    // closing quote here only if the scanner stripped a wrapping pair.
+    id.strip_suffix(b"\"").unwrap_or(id)
+}
+
+/// Clicks are already grouped by person. Only the first click in each
+/// timestamp run can get credit. Assists count each campaign independently.
+fn sort_clicks_with_source_ids(cks: &mut [Ck], chunks: &[Chunk<'_>]) {
+    cks.sort_unstable_by_key(|c| c.ts_rel);
+    let mut start = 0;
+    while start + 1 < cks.len() {
+        let ts = cks[start].ts_rel;
+        if cks[start + 1].ts_rel != ts {
+            start += 1;
+            continue;
+        }
+        let mut best = start;
+        let mut best_id = click_source_id(cks[best].click, chunks);
+        let mut next = start + 1;
+        while next < cks.len() && cks[next].ts_rel == ts {
+            let id = click_source_id(cks[next].click, chunks);
+            // The rules give identical copies of a click identical values.
+            if id < best_id {
+                best = next;
+                best_id = id;
+            }
+            next += 1;
+        }
+        cks.swap(start, best);
+        start = next;
+    }
+}
+
 const NO_PERSON: u32 = u32::MAX;
 
 /// Person key -> dense id (first-insertion order) for one partition.
@@ -1418,6 +1466,12 @@ fn radix_sort_evs_by_ts(evs: &mut Vec<Ev>, tmp: &mut Vec<Ev>) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ClickIds<'a> {
+    Interned { ids: &'a IdInterner, any_fallback: bool },
+    Source(&'a [Chunk<'a>]),
+}
+
 /// Group a gathered partition by person and order each person's records.
 ///
 /// Group by person without a comparison sort over the whole partition: give
@@ -1433,7 +1487,7 @@ fn radix_sort_evs_by_ts(evs: &mut Vec<Ev>, tmp: &mut Vec<Ev>) {
 /// `index.persons` and hence of pushed rows: row order is free in the output
 /// and campaign_days are sums, so output is identical. Returns the instant the
 /// grouping (before per-person sorts) finished.
-fn group_partition(scratch: &mut Scratch, ids: &IdInterner, any_fallback_click: bool, radix: bool) -> Instant {
+fn group_partition(scratch: &mut Scratch, click_ids: ClickIds<'_>, radix: bool) -> Instant {
     let Scratch { evs, ev_tmp, cks, index, dense, evs_by, ev_off, cks_by, ck_off, .. } = scratch;
     if radix {
         radix_sort_evs_by_ts(evs, ev_tmp);
@@ -1462,7 +1516,10 @@ fn group_partition(scratch: &mut Scratch, ids: &IdInterner, any_fallback_click: 
         // click has the byte-wise smallest click_id (rules Clicks 4).
         let slice = &mut cks_by[ck_off[d] as usize..ck_off[d + 1] as usize];
         if slice.len() > 1 {
-            sort_clicks(slice, ids, any_fallback_click);
+            match click_ids {
+                ClickIds::Interned { ids, any_fallback } => sort_clicks(slice, ids, any_fallback),
+                ClickIds::Source(chunks) => sort_clicks_with_source_ids(slice, chunks),
+            }
         }
     }
     t_grouped
@@ -1473,8 +1530,7 @@ struct PersonCtx<'a> {
     ids: &'a IdInterner,
     cat_names: &'a [&'a [u8]],
     organic: u32,
-    /// Any click key anywhere is a fallback key (see `sort_clicks`).
-    any_fallback_click: bool,
+    click_ids: ClickIds<'a>,
 }
 
 /// Gather one person partition's live events and clicks, sort them, and run
@@ -1507,7 +1563,7 @@ fn process_partition<'a>(
     }
     let t_gathered = Instant::now();
     let radix = s_radix_enabled() && scratch.evs.len() >= RADIX_MIN_EVENTS;
-    let t_grouped = group_partition(scratch, ids, pc.any_fallback_click, radix);
+    let t_grouped = group_partition(scratch, pc.click_ids, radix);
     let t_sorted = Instant::now();
     scratch.phase[3] += (t_grouped - t_gathered).as_secs_f64();
     scratch.phase[4] += (t_sorted - t_grouped).as_secs_f64();
@@ -1613,8 +1669,7 @@ fn process_partition<'a>(
         }
 
         // --- Credit (rules Clicks 4-5): latest click with ts <= start and
-        // within 7 days; an equal-ts run is byte-sorted, so its first click
-        // has the smallest ID. ---
+        // within 7 days. Each equal-ts run starts with its smallest ID. ---
         let click_ts = |c: &Ck| base + i64::from(c.ts_rel);
         let mut click_index = 0;
         let mut latest_run_start = 0;
@@ -1759,8 +1814,23 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     campaign_channel[organic as usize] = organic_channel;
     stages.mark("lookups + mmap");
 
+    let parse_level = std::env::var("FAST_PARSE_LEVEL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6);
+    let raw_hex = parse_level == 6 && std::env::var_os("FAST_RAW_EVENT_HEX").as_deref()
+        != Some(std::ffi::OsStr::new("0"));
+
     // --- L: links ---
-    let ids = IdInterner::new();
+    let compact_hex = raw_hex && std::env::var_os("FAST_COMPACT_HEX_TABLE").as_deref()
+        != Some(std::ffi::OsStr::new("0"));
+    let ids = if compact_hex {
+        // Source-backed event IDs leave mainly users and clicks in this table.
+        // Full regions still use the exact overflow interner.
+        IdInterner::with_hex_log2(23)
+    } else {
+        IdInterner::new()
+    };
     let link_files: Vec<&[u8]> = link_maps.iter().map(|map| &map[..]).collect();
     let people = links2::build(&link_files, &ids);
     stages.mark("L links");
@@ -1787,13 +1857,12 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         parts,
         k,
         fallback,
-        parse_level: std::env::var("FAST_PARSE_LEVEL")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(6),
+        parse_level,
     };
-    let raw_hex = ctx.parse_level == 6 && std::env::var_os("FAST_RAW_EVENT_HEX").as_deref()
-        != Some(std::ffi::OsStr::new("0"));
+    let source_click_ids = ctx.parse_level == 6
+        && std::env::var_os("FAST_SOURCE_CLICK_IDS").as_deref() != Some(std::ffi::OsStr::new("0"))
+        && u32::try_from(click_chunks.len()).is_ok()
+        && click_chunks.iter().all(|chunk| u32::try_from(chunk.bytes.len()).is_ok());
 
     // Tasks: (is_event, index), biggest chunks first so the tail is short.
     let mut tasks: Vec<(bool, usize, usize)> = event_chunks
@@ -1819,7 +1888,12 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
                 };
                 Parsed::E(i, chunk)
             } else {
-                Parsed::C(i, parse_click_chunk(&ctx, &click_chunks[i]))
+                let chunk = if source_click_ids {
+                    parse_click_chunk::<true>(&ctx, &click_chunks[i], i)
+                } else {
+                    parse_click_chunk::<false>(&ctx, &click_chunks[i], i)
+                };
+                Parsed::C(i, chunk)
             }
         })
         .collect();
@@ -1874,7 +1948,11 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         ids: &ids,
         cat_names: &cat_names,
         organic,
-        any_fallback_click: ck_chunks.iter().any(|c| c.has_fallback_click),
+        click_ids: if source_click_ids {
+            ClickIds::Source(&click_chunks)
+        } else {
+            ClickIds::Interned { ids: &ids, any_fallback: ck_chunks.iter().any(|c| c.has_fallback_click) }
+        },
     };
     let campaign_count = ctx.campaigns.len();
     let next = AtomicUsize::new(0);
@@ -2449,6 +2527,46 @@ mod tests {
         assert_eq!(got, expected);
     }
 
+    #[test]
+    fn source_click_ids_preserve_tie_winners_and_all_assist_campaigns() {
+        let files: [&[u8]; 2] = [
+            b"id,user,campaign,ts\nz,u,1,5\n\"A \"  ,u,99,5\n\"A \"\",u,99,5\n\"B\",u,2,2\n\"Aa\",u,5,5\n",
+            b"id,user,campaign,ts\n\"A \",\"u\",3,5\nA ,u,3,5\n0,u,4,2\nvery-long-fallback-key,u,6,7",
+        ];
+        let chunks = chunk_files(&files);
+        let ids = IdInterner::new();
+        let mut interned = Vec::new();
+        let mut source = Vec::new();
+        for (i, chunk) in chunks.iter().enumerate() {
+            crate::scan3::for_each_record::<4>(chunk.bytes, chunk.has_header, |fields| {
+                let id = fields[0];
+                let camp = std::str::from_utf8(fields[2]).unwrap().parse().unwrap();
+                let ts_rel = std::str::from_utf8(fields[3]).unwrap().parse().unwrap();
+                let offset = id.as_ptr() as usize - chunk.bytes.as_ptr() as usize;
+                let click = (i as u64) << 32 | offset as u64;
+                assert_eq!(click_source_id(click, &chunks), id);
+                source.push(Ck { person: 7, click, ts_rel, camp });
+                interned.push(Ck { person: 7, click: key_of(id, &ids), ts_rel, camp });
+            });
+        }
+        assert_eq!(source.len(), 7);
+        sort_clicks_with_source_ids(&mut source, &chunks);
+        sort_clicks(&mut interned, &ids, true);
+        let winners = |clicks: &[Ck]| {
+            clicks.chunk_by(|a, b| a.ts_rel == b.ts_rel)
+                .map(|run| (run[0].ts_rel, run[0].camp))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(winners(&source), vec![(2, 4), (5, 3), (7, 6)]);
+        assert_eq!(winners(&source), winners(&interned));
+        let campaigns = |clicks: &[Ck]| {
+            let mut values: Vec<_> = clicks.iter().map(|c| (c.ts_rel, c.camp)).collect();
+            values.sort_unstable();
+            values
+        };
+        assert_eq!(campaigns(&source), campaigns(&interned));
+    }
+
     /// Differential: radix pre-sort + stable grouping vs the old per-person
     /// sort. For every person the event slice must be the same multiset and
     /// sorted by ts_rel; the person set must match (dense order may differ).
@@ -2485,8 +2603,9 @@ mod tests {
             old.cks.clear();
             new.evs.clone_from(&evs);
             new.cks.clear();
-            group_partition(&mut old, &ids, false, false);
-            group_partition(&mut new, &ids, false, true);
+            let click_ids = ClickIds::Interned { ids: &ids, any_fallback: false };
+            group_partition(&mut old, click_ids, false);
+            group_partition(&mut new, click_ids, true);
             assert_eq!(old.index.persons.len(), new.index.persons.len());
             let by_person = |s: &Scratch| -> std::collections::HashMap<IdKey, Vec<Ev>> {
                 s.index
