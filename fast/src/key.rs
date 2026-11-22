@@ -13,12 +13,26 @@ use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::hash::{hash_bytes, FastMap};
+use crate::hexid::{self, HexTable, HEX_ID_LEN};
 
 /// The integer representation used by the v2 pipeline for every nonempty ID.
 ///
 /// Packed keys have a length nibble in `1..=10`. A zero length nibble marks an
-/// exact fallback and the upper 60 bits hold its index in [`IdInterner`].
+/// exact fallback and the upper 60 bits hold its index in [`IdInterner`]:
+/// bit 63 set ([`HEX_TAG`]) = slot index in the lock-free hex table (bits
+/// 4..=31 hold it); bit 63 clear = sharded-interner index in bits 4..=35.
+/// Outside this file, fallback keys are only tested with `key & 0x0f == 0`,
+/// hashed, or compared for equality, never decoded.
 pub type IdKey = u64;
+
+/// Fallback-key tag for IDs held in the [`HexTable`].
+const HEX_TAG: u64 = 1 << 63;
+
+/// log2 slots of the hex table made by [`IdInterner::new`]: 2^25 slots x 24 B
+/// = 768 MiB of *virtual* memory (lazily zero-filled mmap; RSS grows only with
+/// the pages actually touched). ~10M distinct hex IDs at 60M rows is load
+/// ~0.3; IDs whose 64-slot region fills (overload) go exactly to the shards.
+const HEX_LOG2_SLOTS: u32 = 25;
 
 /// log2 of the number of interner shards. 1024 shards keep lock contention
 /// negligible when 1 in 8 distinct IDs is a (33-byte, unpackable) fallback.
@@ -43,6 +57,10 @@ struct Shard {
 /// lookups decode the shard directly and lock only that shard. There is no
 /// global lock and no global counter on the insert path.
 pub struct IdInterner {
+    /// `^[a-z][0-9a-f]{32}$` IDs, inline and lock-free (see hexid.rs). An ID
+    /// of that shape whose table region is full lives in `shards` instead;
+    /// that choice is permanent and identical on every thread.
+    hex: HexTable,
     shards: Box<[Mutex<Shard>]>,
     /// Number of distinct fallbacks. Informational (tests only), Relaxed.
     count: AtomicUsize,
@@ -70,7 +88,14 @@ fn decode_index(index: u32) -> (usize, usize) {
 
 impl IdInterner {
     pub fn new() -> Self {
+        Self::with_hex_log2(HEX_LOG2_SLOTS)
+    }
+
+    /// Like [`new`](Self::new) with a `2^log2` slot hex table (tests force
+    /// overflow into the shards with a tiny table).
+    fn with_hex_log2(log2: u32) -> Self {
         Self {
+            hex: HexTable::new(log2),
             shards: (0..FALLBACK_SHARDS)
                 .map(|_| Mutex::new(Shard::default()))
                 .collect(),
@@ -134,8 +159,27 @@ impl IdInterner {
         out.extend_from_slice(bytes);
     }
 
+    /// Exact key for an ID that `pack` rejected.
+    #[inline]
+    fn fallback_key(&self, bytes: &[u8]) -> IdKey {
+        if let Some((prefix, value)) = hexid::try_parse(bytes) {
+            if let Some(index) = self.hex.intern(prefix, value) {
+                return HEX_TAG | (index as u64) << 4;
+            }
+        }
+        (self.intern(bytes) as u64) << 4
+    }
+
+    /// The hex ID behind a `HEX_TAG` key.
+    #[inline]
+    fn hex_get(&self, key: IdKey) -> (u8, u128) {
+        debug_assert!(key & HEX_TAG != 0 && key & 0x0f == 0);
+        self.hex.get(((key & !HEX_TAG) >> 4) as u32)
+    }
+
+    /// Distinct fallback IDs. The hex part is an O(table) scan: tests only.
     pub fn len(&self) -> usize {
-        self.count.load(AtomicOrdering::Relaxed)
+        self.count.load(AtomicOrdering::Relaxed) + self.hex.count()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -149,7 +193,10 @@ impl IdInterner {
 #[inline]
 pub fn key_of(bytes: &[u8], interner: &IdInterner) -> IdKey {
     assert!(!bytes.is_empty(), "empty IDs are handled by the caller");
-    pack(bytes).unwrap_or_else(|| (interner.intern(bytes) as u64) << 4)
+    match pack(bytes) {
+        Some(key) => key,
+        None => interner.fallback_key(bytes),
+    }
 }
 
 /// Materialize the bytes represented by `key` into `buf`.
@@ -159,7 +206,11 @@ pub fn key_of(bytes: &[u8], interner: &IdInterner) -> IdKey {
 /// interner.
 pub fn key_bytes<'a>(key: IdKey, interner: &IdInterner, buf: &'a mut Vec<u8>) -> &'a [u8] {
     let len = (key & 0x0f) as usize;
-    if len == 0 {
+    if len == 0 && key & HEX_TAG != 0 {
+        let (prefix, value) = interner.hex_get(key);
+        buf.clear();
+        buf.extend_from_slice(&hexid::render(prefix, value));
+    } else if len == 0 {
         interner.copy_bytes((key >> 4) as u32, buf);
     } else {
         assert!(len <= 10, "invalid packed ID length nibble: {len}");
@@ -175,6 +226,7 @@ pub fn key_bytes<'a>(key: IdKey, interner: &IdInterner, buf: &'a mut Vec<u8>) ->
 /// stack, fallbacks share the interner's `Arc`.
 enum KeyBytes {
     Packed([u8; 10], usize),
+    Hex([u8; HEX_ID_LEN]),
     Fallback(Arc<[u8]>),
 }
 
@@ -182,7 +234,10 @@ impl KeyBytes {
     #[inline]
     fn new(key: IdKey, interner: &IdInterner) -> Self {
         let len = (key & 0x0f) as usize;
-        if len == 0 {
+        if len == 0 && key & HEX_TAG != 0 {
+            let (prefix, value) = interner.hex_get(key);
+            KeyBytes::Hex(hexid::render(prefix, value))
+        } else if len == 0 {
             KeyBytes::Fallback(interner.get_arc((key >> 4) as u32))
         } else {
             assert!(len <= 10, "invalid packed ID length nibble: {len}");
@@ -196,6 +251,7 @@ impl KeyBytes {
     fn as_slice(&self) -> &[u8] {
         match self {
             KeyBytes::Packed(buf, len) => &buf[..*len],
+            KeyBytes::Hex(buf) => buf,
             KeyBytes::Fallback(bytes) => bytes,
         }
     }
@@ -214,6 +270,16 @@ pub fn key_cmp(a: IdKey, b: IdKey, interner: &IdInterner) -> Ordering {
     }
     if a == b {
         return Ordering::Equal;
+    }
+    // Two hex-table IDs: compare (prefix, value) numerically. Both are exactly
+    // 33 bytes, so byte order is lexicographic over equal lengths: byte 0 is
+    // the prefix itself, and bytes 1..=32 are fixed-width big-endian digits of
+    // `value` (first digit most significant). The digit -> ASCII map
+    // 0..9 -> '0'..'9' (0x30..0x39), 10..15 -> 'a'..'f' (0x61..0x66) is
+    // strictly increasing, so comparing digit strings bytewise equals
+    // comparing their values, i.e. comparing the u128s.
+    if a & b & HEX_TAG != 0 && (a | b) & 0x0f == 0 {
+        return interner.hex_get(a).cmp(&interner.hex_get(b));
     }
     let a_bytes = KeyBytes::new(a, interner);
     let b_bytes = KeyBytes::new(b, interner);
@@ -772,13 +838,145 @@ mod tests {
         for _ in 0..20_000 {
             let id = random_id(&mut rng);
             let key = key_of(&id, &interner);
-            if pack(&id).is_none() {
+            if pack(&id).is_none() && key & HEX_TAG != 0 {
                 assert_eq!(key & 0x0f, 0);
+                assert!(hexid::try_parse(&id).is_some());
+            } else if pack(&id).is_none() {
+                assert_eq!(key & 0x0f, 0);
+                assert!(hexid::try_parse(&id).is_none());
                 let (shard, local) = decode_index((key >> 4) as u32);
                 assert!(shard < FALLBACK_SHARDS);
                 assert_eq!(&*interner.lock(shard).rev[local], id.as_slice());
             }
             assert_eq!(key_bytes(key, &interner, &mut buf), id.as_slice());
+        }
+    }
+
+    /// Hex-shaped IDs and near misses: valid `[a-z][0-9a-f]{32}`, uppercase
+    /// digits, a bad byte, wrong length, bad prefix, plus `random_id` mix.
+    fn random_hexish_id(rng: &mut XorShift64) -> Vec<u8> {
+        const HEX: &[u8] = b"0123456789abcdef";
+        // Small digit space so the same IDs recur across threads.
+        let mut id = vec![b'a' + (rng.next() % 3) as u8];
+        id.extend((0..32).map(|i| if i < 28 { b'0' } else { HEX[(rng.next() & 15) as usize] }));
+        match rng.next() % 9 {
+            0..=2 => {}
+            3 => {
+                let pos = 1 + (rng.next() % 32) as usize;
+                id[pos] = b"ABCDEFgG \r\x00\xff/:`"[(rng.next() % 14) as usize];
+            }
+            4 => {
+                id.truncate(32);
+            }
+            5 => id.push(HEX[(rng.next() & 15) as usize]),
+            6 => id[0] = b"AZ0_-\xc3`{"[(rng.next() % 8) as usize],
+            _ => return random_id(rng),
+        }
+        id
+    }
+
+    fn stress_exact(interner: &IdInterner, gen: fn(&mut XorShift64) -> Vec<u8>, seed: u64) {
+        use std::collections::HashMap;
+        let mut rng = XorShift64(seed);
+        let universe: Vec<Vec<u8>> = (0..50_000).map(|_| gen(&mut rng)).collect();
+        let results: Vec<Vec<(usize, IdKey)>> = std::thread::scope(|scope| {
+            let joins: Vec<_> = (0..8u64)
+                .map(|t| {
+                    let universe = &universe;
+                    scope.spawn(move || {
+                        let mut rng = XorShift64(seed ^ (t + 1) * 0x1000_0001);
+                        (0..50_000)
+                            .map(|_| {
+                                let i = rng.next() as usize % universe.len();
+                                (i, key_of(&universe[i], interner))
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            joins.into_iter().map(|j| j.join().unwrap()).collect()
+        });
+        let mut key_by_bytes: HashMap<&[u8], IdKey> = HashMap::new();
+        let mut bytes_by_key: HashMap<IdKey, &[u8]> = HashMap::new();
+        let mut buf = Vec::new();
+        for (i, key) in results.into_iter().flatten() {
+            let bytes = universe[i].as_slice();
+            assert_eq!(*key_by_bytes.entry(bytes).or_insert(key), key, "same bytes, different keys: {bytes:?}");
+            assert_eq!(*bytes_by_key.entry(key).or_insert(bytes), bytes, "same key, different bytes");
+            assert_eq!(key_bytes(key, interner, &mut buf), bytes);
+            if key & HEX_TAG != 0 && key & 0x0f == 0 {
+                assert!(hexid::try_parse(bytes).is_some(), "{bytes:?}");
+            }
+            if key & 0x0f == 0 && hexid::try_parse(bytes).is_none() {
+                assert_eq!(key & HEX_TAG, 0);
+            }
+        }
+        for (bytes, &key) in &key_by_bytes {
+            assert_eq!(key_of(bytes, interner), key);
+        }
+        let seen: Vec<(&[u8], IdKey)> = key_by_bytes.iter().map(|(b, k)| (*b, *k)).collect();
+        for _ in 0..200_000 {
+            let (a, ka) = seen[rng.next() as usize % seen.len()];
+            let (b, kb) = seen[rng.next() as usize % seen.len()];
+            assert_eq!(key_cmp(ka, kb, interner), a.cmp(b), "{a:?} vs {b:?}");
+        }
+        let fallbacks = key_by_bytes.keys().filter(|b| pack(b).is_none()).count();
+        assert_eq!(interner.len(), fallbacks);
+    }
+
+    #[test]
+    fn hex_table_concurrent_stress_default_capacity() {
+        let interner = IdInterner::new();
+        stress_exact(&interner, random_hexish_id, 0x0f0f_1234_5678_9abc);
+        assert!(interner.hex.count() > 1_000);
+        let interner = IdInterner::new();
+        stress_exact(&interner, random_id, 0x7777_1234_5678_9abc);
+        assert!(interner.hex.count() > 1_000);
+    }
+
+    #[test]
+    fn hex_table_concurrent_stress_tiny_capacity_overflows_exactly() {
+        // 128 slots: most hex IDs overflow into the shards, concurrently.
+        let interner = IdInterner::with_hex_log2(7);
+        stress_exact(&interner, random_hexish_id, 0x0f0f_1234_5678_9abc);
+        assert!(interner.hex.count() > 64);
+        let interner = IdInterner::with_hex_log2(7);
+        stress_exact(&interner, random_id, 0x7777_1234_5678_9abc);
+        assert!(interner.hex.count() > 64);
+        assert!(interner.count.load(AtomicOrdering::Relaxed) > 1_000);
+    }
+
+    #[test]
+    fn hex_overflow_falls_back_and_orders_exactly() {
+        let interner = IdInterner::with_hex_log2(6); // one 64-slot region
+        let ids: Vec<Vec<u8>> = (0..300u32)
+            .map(|n| {
+                let mut id = format!("{}{:032x}", (b'a' + (n % 26) as u8) as char, n as u128 * 0x9e37_79b9_7f4a_7c15)
+                    .into_bytes();
+                id.truncate(33);
+                id
+            })
+            .collect();
+        let keys: Vec<IdKey> = ids.iter().map(|id| key_of(id, &interner)).collect();
+        let hex = keys.iter().filter(|k| *k & HEX_TAG != 0).count();
+        assert_eq!(hex, 64);
+        assert_eq!(interner.len(), 300);
+        let mut buf = Vec::new();
+        for (id, &key) in ids.iter().zip(&keys) {
+            assert_eq!(key & 0x0f, 0);
+            assert_eq!(key_of(id, &interner), key);
+            assert_eq!(key_bytes(key, &interner, &mut buf), id.as_slice());
+        }
+        let mut more = ids.clone();
+        more.push(b"a".to_vec());
+        more.push(b"a0000".to_vec());
+        more.push(b"A0000000000000000000000000000000f".to_vec());
+        let more_keys: Vec<IdKey> = more.iter().map(|id| key_of(id, &interner)).collect();
+        for a in 0..more.len() {
+            for b in 0..more.len() {
+                assert_eq!(key_cmp(more_keys[a], more_keys[b], &interner), more[a].cmp(&more[b]));
+                assert_eq!(more_keys[a] == more_keys[b], more[a] == more[b]);
+            }
         }
     }
 

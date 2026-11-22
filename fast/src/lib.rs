@@ -5,6 +5,7 @@
 
 pub mod hash; // fast non-cryptographic hash + HashMap alias
 pub mod csvline; // the rules.md CSV dialect: lines, fields, quotes, malformed
+pub mod hexid; // lock-free exact table for 33-byte [a-z][0-9a-f]{32} IDs
 pub mod intern; // byte-string IDs -> dense u32 handles
 pub mod key; // short byte-string IDs -> order-preserving u64
 pub mod links2; // v2 parallel links -> integer person-name keys
