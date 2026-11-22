@@ -505,18 +505,16 @@ fn build_names<const ALIASES_ONLY: bool, T>(
     timer.mark("count");
 
     // Phase 1: parse and insert. Self-links are dropped here (no-ops).
+    let batch_scan = cfg!(all(target_arch = "x86_64", target_feature = "avx2"))
+        && std::env::var_os("FAST_LINK_SCAN").as_deref() != Some(std::ffi::OsStr::new("0"));
     let distinct = AtomicUsize::new(0);
     let edges: Vec<Vec<(u32, u32)>> = file_chunks
         .par_iter()
         .map(|chunk| {
             let mut edges = Vec::with_capacity(chunk.bytes.len() / 20);
-            let mut fields = Vec::with_capacity(2);
             let mut inserted = 0usize;
-            for_each_line(chunk, |line| {
-                if !split_fields(line, 2, &mut fields)
-                    || fields[0].is_empty()
-                    || fields[1].is_empty()
-                {
+            let mut insert = |left: &[u8], right: &[u8]| {
+                if left.is_empty() || right.is_empty() {
                     return;
                 }
                 let encode = |id| {
@@ -526,13 +524,25 @@ fn build_names<const ALIASES_ONLY: bool, T>(
                         key_of(id, interner)
                     }
                 };
-                let (a, new_a) = table.insert(encode(fields[0]));
-                let (b, new_b) = table.insert(encode(fields[1]));
+                let (a, new_a) = table.insert(encode(left));
+                let (b, new_b) = table.insert(encode(right));
                 inserted += new_a as usize + new_b as usize;
                 if a != b {
                     edges.push((a, b));
                 }
-            });
+            };
+            if batch_scan {
+                crate::scan3::for_each_record::<2>(chunk.bytes, chunk.has_header, true, |fields| {
+                    insert(fields[0], fields[1]);
+                });
+            } else {
+                let mut fields = Vec::with_capacity(2);
+                for_each_line(chunk, |line| {
+                    if split_fields(line, 2, &mut fields) {
+                        insert(fields[0], fields[1]);
+                    }
+                });
+            }
             if !ALIASES_ONLY {
                 distinct.fetch_add(inserted, Relaxed);
             }

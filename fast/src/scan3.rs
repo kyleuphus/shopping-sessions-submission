@@ -5,7 +5,8 @@
 //! 64-byte block, three bitmasks — commas, quotes, newlines — and walks the
 //! comma/newline bits in order with `trailing_zeros`. The batched scanner
 //! checks quote syntax in the masks, then consumes the delimiter offsets in
-//! groups of four (clicks) or seven (events). Neither scanner allocates per line.
+//! groups of two (x86 links), four (clicks), or seven (events). Neither scanner
+//! allocates per line.
 //!
 //! The result is defined to be exactly what the old path produced (see the
 //! differential tests at the bottom, which compare against `split_fields` on
@@ -110,7 +111,7 @@ fn block_masks_scalar(block: &[u8; 64]) -> Masks {
 /// Malformed lines (see the module doc) are skipped silently. If `skip_header`
 /// the first line (up to and including its `\n`) is skipped; a header with no
 /// `\n` means there are no data lines. `fast` enables the batched scanner for
-/// the two pipeline schemas.
+/// supported pipeline schemas.
 #[inline]
 pub fn for_each_record<'a, const N: usize>(
     bytes: &'a [u8],
@@ -212,7 +213,9 @@ pub(crate) fn for_each_row<'a, const N: usize>(
     } else {
         bytes
     };
-    if fast && cfg!(target_endian = "little") && (N == 4 || N == 7) {
+    let batched = N == 4 || N == 7
+        || (N == 2 && cfg!(all(target_arch = "x86_64", target_feature = "avx2")));
+    if fast && cfg!(target_endian = "little") && batched {
         scan_batches(buf, stats, &mut f);
     } else {
         scan_legacy(buf, &mut |fields| f(Fields(FieldRepr::Slices(fields))));
@@ -1004,6 +1007,8 @@ mod tests {
                 assert_eq!(stats.fast_records + stats.fallback_records, 407);
             }
         }
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        check_batches::<2>(b"\"a\",b\r\n", b"too,many,fields\nonly_one\n");
         check_batches::<4>(b"\"A\",,\"\",t\r\n", b"too,many,,fields,here\nonly,three,fields\n");
         check_batches::<7>(b"e,\"U\",,2027-10-01T12:00:00Z,\"view\",p,\"\"\n", b"a,b,c\na,b,c,d,e,f,g,h,i,j,k\n");
     }
@@ -1154,7 +1159,7 @@ mod tests {
                     buf.push(b'\n');
                 }
                 // Mostly well-formed-ish lines with N-1 commas, sometimes noise.
-                let n = [4usize, 7][(next() % 2) as usize];
+                let n = [2usize, 4, 7][(next() % 3) as usize];
                 let noisy = next() % 4 == 0;
                 for k in 0..n {
                     let quoted = next() % 5 == 0;
@@ -1181,9 +1186,10 @@ mod tests {
                     buf.push(b'\n');
                 }
             }
+            check::<2>(&buf);
             check::<4>(&buf);
             check::<7>(&buf);
-            accepted += scanned::<4>(&buf, false).len() + scanned::<7>(&buf, false).len();
+            accepted += scanned::<2>(&buf, false).len() + scanned::<4>(&buf, false).len() + scanned::<7>(&buf, false).len();
         }
         // The generator must exercise accepted lines, not only rejections.
         assert!(accepted > 3000, "only {accepted} accepted records");
