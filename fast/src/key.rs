@@ -198,6 +198,16 @@ const ALPHABET: [u8; 64] = *b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijkl
 /// byte is in `-0-9A-Z_a-z`. All other inputs must stay on the exact-byte path.
 #[inline]
 pub fn pack(b: &[u8]) -> Option<u64> {
+    #[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "bmi2"))]
+    if (8..=10).contains(&b.len()) {
+        return pack_long_x86(b);
+    }
+
+    pack_scalar(b)
+}
+
+#[inline]
+fn pack_scalar(b: &[u8]) -> Option<u64> {
     let len = b.len();
     if len == 0 || len > 10 {
         return None;
@@ -213,6 +223,68 @@ pub fn pack(b: &[u8]) -> Option<u64> {
     }
 
     Some((payload << ((10 - len) * 6 + 4)) | len as u64)
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3", target_feature = "bmi2"))]
+#[inline]
+fn pack_long_x86(b: &[u8]) -> Option<u64> {
+    use std::arch::x86_64::*;
+
+    const VALID_HIGH_BY_LOW: [u8; 16] = {
+        let mut masks = [0; 16];
+        let mut byte = 0;
+        while byte < 128 {
+            if CODES[byte] != INVALID {
+                masks[byte & 15] |= 1 << (byte >> 4);
+            }
+            byte += 1;
+        }
+        masks
+    };
+
+    let len = b.len();
+    let prefix = u64::from_be_bytes(b[..8].try_into().unwrap());
+    let tail = u16::from_be_bytes(b[len - 2..].try_into().unwrap());
+    // SAFETY: SSSE3 and BMI2 are enabled by the cfg. The SIMD input is built
+    // from two in-bounds reads, with overlap when there are fewer than ten bytes.
+    unsafe {
+        let bytes = _mm_set_epi64x(tail as i64, prefix as i64);
+        let nibble_mask = _mm_set1_epi8(15);
+        let low = _mm_and_si128(bytes, nibble_mask);
+        let high = _mm_and_si128(_mm_srli_epi16::<4>(bytes), nibble_mask);
+        let allowed = _mm_shuffle_epi8(
+            _mm_loadu_si128(VALID_HIGH_BY_LOW.as_ptr().cast()),
+            low,
+        );
+        let high_bit = _mm_shuffle_epi8(
+            _mm_setr_epi8(1, 2, 4, 8, 16, 32, 64, -128, 0, 0, 0, 0, 0, 0, 0, 0),
+            high,
+        );
+        let invalid = _mm_cmpeq_epi8(_mm_and_si128(allowed, high_bit), _mm_setzero_si128());
+        if _mm_movemask_epi8(invalid) & 0x03ff != 0 {
+            return None;
+        }
+
+        // Each ASCII range has a constant byte-minus-code offset. Underscore
+        // shares a high nibble with P..Z but has an offset four larger.
+        let offsets = _mm_shuffle_epi8(
+            _mm_setr_epi8(0, 0, 45, 47, 54, 54, 59, 59, 0, 0, 0, 0, 0, 0, 0, 0),
+            high,
+        );
+        let underscore = _mm_cmpeq_epi8(bytes, _mm_set1_epi8(b'_' as i8));
+        let codes = _mm_sub_epi8(
+            _mm_sub_epi8(bytes, offsets),
+            _mm_and_si128(underscore, _mm_set1_epi8(4)),
+        );
+
+        // The big-endian reads put the first byte in the highest lane of
+        // each chunk. PEXT preserves that order as it removes lane padding.
+        let prefix = _pext_u64(_mm_cvtsi128_si64(codes) as u64, 0x3f3f_3f3f_3f3f_3f3f);
+        let tail = _pext_u64(_mm_cvtsi128_si64(_mm_srli_si128::<8>(codes)) as u64, 0x3f3f);
+        let padding = (10 - len) * 6;
+        let tail = (tail & (0xfff >> padding)) << (padding + 4);
+        Some((prefix << 16) | tail | len as u64)
+    }
 }
 
 /// Write the bytes represented by a key returned from [`pack`] into `buf`.
@@ -476,6 +548,76 @@ mod tests {
             assert!(pair[0] < pair[1]);
             assert!(pack(pair[0]).unwrap() < pack(pair[1]).unwrap());
         }
+    }
+
+    #[test]
+    fn pack_scalar_differential() {
+        let mut rng = XorShift64(0x9e37_79b9_7f4a_7c15);
+        let mut buf = [0; 16];
+        let check = |b: &[u8]| assert_eq!(pack(b), pack_scalar(b), "ID {b:?}");
+        for _ in 0..1_700_000 {
+            let len = (rng.next() % 17) as usize;
+            let b = &mut buf[..len];
+            for byte in b.iter_mut() {
+                *byte = rng.next() as u8;
+            }
+            check(b);
+
+            for byte in b.iter_mut() {
+                *byte = ALPHABET[(rng.next() & 63) as usize];
+            }
+            check(b);
+            if len != 0 {
+                b[rng.next() as usize % len] ^= (rng.next() % 255 + 1) as u8;
+            }
+            check(b);
+        }
+
+        for len in 0..=16 {
+            let mut dashes = [b'-'; 16];
+            check(&dashes[..len]);
+            for pos in 0..len {
+                for byte in 0..=255 {
+                    dashes[pos] = byte;
+                    check(&dashes[..len]);
+                }
+                dashes[pos] = b'-';
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark: ten million mixed ID packs"]
+    fn pack_cost_probe() {
+        const COUNT: usize = 10_000_000;
+        let mut rng = XorShift64(0x4d59_5df4_d0f3_3173);
+        let ids: Vec<Vec<u8>> = (0..4_000)
+            .map(|i| {
+                let mut id = match i % 7 {
+                    0 | 1 => format!("u{:07}", rng.next() % 10_000_000).into_bytes(),
+                    2 | 3 => format!("e{:08}", rng.next() % 100_000_000).into_bytes(),
+                    4 => format!("c_{}", rng.next() % 100).into_bytes(),
+                    5 => format!("p{}", rng.next() % 1_000).into_bytes(),
+                    _ => (0..2 + rng.next() % 9)
+                        .map(|_| ALPHABET[(rng.next() & 63) as usize])
+                        .collect(),
+                };
+                if i % 20 == 0 {
+                    let pos = rng.next() as usize % id.len();
+                    id[pos] = b' ';
+                }
+                id
+            })
+            .collect();
+
+        let started = Instant::now();
+        for id in ids.iter().cycle().take(COUNT) {
+            black_box(pack(black_box(id.as_slice())));
+        }
+        eprintln!(
+            "pack_cost_probe: {:.3} ns/call",
+            started.elapsed().as_nanos() as f64 / COUNT as f64
+        );
     }
 
     #[test]

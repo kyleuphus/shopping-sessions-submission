@@ -504,7 +504,7 @@ fn parse_event_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChu
     let scan_bytes: &[u8] = if level < 1 { &[] } else { chunk.bytes };
     // One SIMD pass per chunk; malformed lines never reach the closure.
     crate::scan3::for_each_record::<7>(scan_bytes, chunk.has_header, |fields| {
-        let fields = *fields;
+        let fields: &[&[u8]; 7] = fields;
         // rules Events 1: empty event_id produces nothing.
         if fields[0].is_empty() {
             return;
@@ -530,7 +530,7 @@ fn parse_event_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>, chunk_id: usize) -> EvChu
             std::hint::black_box(ekey);
             return;
         }
-        let valid = ctx.validate_event(&fields, ingest_ms);
+        let valid = ctx.validate_event(fields, ingest_ms);
         if level < 4 {
             std::hint::black_box(valid);
             return;
@@ -642,7 +642,7 @@ fn parse_click_chunk(ctx: &Ctx<'_>, chunk: &Chunk<'_>) -> CkChunk {
     }
     let scan_bytes: &[u8] = if level < 1 { &[] } else { chunk.bytes };
     crate::scan3::for_each_record::<4>(scan_bytes, chunk.has_header, |fields| {
-        let fields = *fields;
+        let fields: &[&[u8]; 4] = fields;
         if level < 3 {
             std::hint::black_box(&fields);
             return;
@@ -756,13 +756,154 @@ fn tok_key(tok: &Tok) -> u128 {
     (u128::from(tok.ekey) << 64) | (u128::from(tok.ingest_s) << 32) | u128::from(tok.rec)
 }
 
-fn dedup_partition(chunks: &[EvChunk], partition: usize, k: u32) {
+/// The old gather + sort path for one partition: kept as the fallback for a
+/// partition too big for the streaming table's scratch, and as the reference
+/// the streaming kernel is differentially tested against.
+fn dedup_partition_sorted(chunks: &[EvChunk], partition: usize, k: u32) {
     let mut keys = Vec::new();
     for chunk in chunks {
         let slice = &chunk.toks[chunk.tok_off[partition] as usize..chunk.tok_off[partition + 1] as usize];
         keys.extend(slice.iter().map(tok_key));
     }
     dedup_keys(&mut keys, &DeadView { chunks, k });
+}
+
+/// Per-worker scratch cap for the streaming dedup table (slots + stamps).
+const DEDUP_SCRATCH_BYTES: usize = 8 << 20;
+/// Salt for the table index hash. Deliberately different from the salt in
+/// `Parts::event`: every key in a partition shares the top bits of *that*
+/// hash, so reusing it would pile the table onto a fraction of its slots.
+/// (We also take the LOW bits here, the partition id uses the HIGH bits.)
+const DEDUP_SALT: u64 = 0x6465_6475_705f_7633; // "dedup_v3"
+
+/// One winner-table entry: the best copy seen so far of event `ekey`.
+#[derive(Clone, Copy, Default)]
+struct WinSlot {
+    ekey: IdKey,
+    ingest_s: u32,
+    rec: u32,
+}
+
+/// Bytes per table slot: the slot itself plus its epoch stamp.
+const WIN_SLOT_BYTES: usize = std::mem::size_of::<WinSlot>() + std::mem::size_of::<u32>();
+
+/// Reusable per-worker winner table. A slot is occupied iff
+/// `stamps[i] == epoch`; bumping `epoch` empties the whole table without
+/// touching memory. Slots past the current table size keep stale stamps, which
+/// are always `< epoch` (stamps only ever take epoch values already used), so
+/// growing is safe. When `epoch` would wrap, every stamp is zeroed first.
+#[derive(Default)]
+struct DedupScratch {
+    slots: Vec<WinSlot>,
+    stamps: Vec<u32>,
+    epoch: u32,
+}
+
+std::thread_local! {
+    static DEDUP_SCRATCH: std::cell::RefCell<DedupScratch> = std::cell::RefCell::new(DedupScratch::default());
+}
+
+/// `(ingest_s, rec)` as one integer, ordered exactly like the low 64 bits of
+/// `tok_key` (ingest first, then rec; `NONE` = u32::MAX sorts last on a tie).
+#[inline(always)]
+fn ingest_rec(ingest_s: u32, rec: u32) -> u64 {
+    (u64::from(ingest_s) << 32) | u64::from(rec)
+}
+
+/// Streaming dedup of one event partition: one pass over every chunk's token
+/// slice, keeping per event (exact `ekey` equality, never hash identity) the
+/// copy with the smallest `(ingest_s, rec)`; every copy that loses a
+/// comparison is marked dead at that moment.
+///
+/// Equivalence with `dedup_keys` (gather + sort): for one event with copies
+/// `C`, the sort path picks `w = min(C)` by `(ingest_s, rec)` and marks every
+/// copy except `w` (or every copy, if `w.rec == NONE`; marking `NONE` is a
+/// no-op). Here, each comparison marks the larger of the stored copy and the
+/// arriving one (the arriving one on an exact tie) and keeps the smaller, so
+/// after the pass the table holds `min(C)` = `w`, and every other copy was
+/// marked exactly once (when it lost - a copy is only ever compared while it
+/// is the stored or arriving one, and once it loses it leaves the table).
+/// `w` itself is never marked: it never compares larger than anything, and an
+/// exact tie with `w` is only possible for another `NONE` copy with the same
+/// ingest (valid `rec`s are unique), where both are no-op marks anyway. So the
+/// set of marked valid recs is "all valid copies but `w`", or "all valid
+/// copies" if `w.rec == NONE` - identical to the sort path, whatever order the
+/// copies arrive in (the min of a set does not depend on order, and marks are
+/// idempotent `fetch_or`s).
+///
+/// Returns false, having marked nothing, if this partition's table would
+/// exceed `cap_bytes`; the caller must then use the sort path.
+fn dedup_stream(chunks: &[EvChunk], partition: usize, k: u32, scratch: &mut DedupScratch, cap_bytes: usize) -> bool {
+    let n: usize = chunks
+        .iter()
+        .map(|c| (c.tok_off[partition + 1] - c.tok_off[partition]) as usize)
+        .sum();
+    if n == 0 {
+        return true;
+    }
+    // Load factor <= 1/2, so a probe always finds an empty slot or its key.
+    let size = n.saturating_mul(2).next_power_of_two();
+    if size.saturating_mul(WIN_SLOT_BYTES) > cap_bytes {
+        return false;
+    }
+    if scratch.slots.len() < size {
+        scratch.slots.resize(size, WinSlot::default());
+        scratch.stamps.resize(size, 0); // 0 is never a live epoch (see below)
+    }
+    if scratch.epoch == u32::MAX {
+        scratch.stamps.fill(0);
+        scratch.epoch = 0;
+    }
+    scratch.epoch += 1; // live epochs are 1..=u32::MAX
+    let epoch = scratch.epoch;
+    let mask = size - 1;
+    let slots = &mut scratch.slots[..size];
+    let stamps = &mut scratch.stamps[..size];
+    let dead = DeadView { chunks, k };
+    for chunk in chunks {
+        let slice = &chunk.toks[chunk.tok_off[partition] as usize..chunk.tok_off[partition + 1] as usize];
+        for tok in slice {
+            let mut i = fmix64(tok.ekey ^ DEDUP_SALT) as usize & mask;
+            loop {
+                if stamps[i] != epoch {
+                    // First copy of this event: it is the winner so far.
+                    stamps[i] = epoch;
+                    slots[i] = WinSlot {
+                        ekey: tok.ekey,
+                        ingest_s: tok.ingest_s,
+                        rec: tok.rec,
+                    };
+                    break;
+                }
+                let slot = &mut slots[i];
+                if slot.ekey == tok.ekey {
+                    if ingest_rec(tok.ingest_s, tok.rec) < ingest_rec(slot.ingest_s, slot.rec) {
+                        dead.mark(slot.rec); // no-op if the old winner is NONE
+                        slot.ingest_s = tok.ingest_s;
+                        slot.rec = tok.rec;
+                    } else {
+                        dead.mark(tok.rec); // no-op if NONE
+                    }
+                    break;
+                }
+                i = (i + 1) & mask;
+            }
+        }
+    }
+    true
+}
+
+/// Streaming dedup with the sort path as a fallback for oversized partitions.
+fn dedup_partition_with(chunks: &[EvChunk], partition: usize, k: u32, scratch: &mut DedupScratch, cap_bytes: usize) {
+    if !dedup_stream(chunks, partition, k, scratch, cap_bytes) {
+        dedup_partition_sorted(chunks, partition, k);
+    }
+}
+
+fn dedup_partition(chunks: &[EvChunk], partition: usize, k: u32) {
+    DEDUP_SCRATCH.with(|scratch| {
+        dedup_partition_with(chunks, partition, k, &mut scratch.borrow_mut(), DEDUP_SCRATCH_BYTES);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1744,6 +1885,206 @@ mod tests {
         assert!(dead(&chunks, 1, 0));
         assert!(dead(&chunks, 1, 1));
         assert!(!dead(&chunks, 0, 0));
+    }
+
+    /// Tiny xorshift64* for the randomized dedup tests (no rand dependency).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Random event chunks with `parts` event partitions. Event keys come from
+    /// a small pool (forcing many copies per event, including extreme values),
+    /// ingest from a tiny range (many ties), ~20% of copies are `NONE`, and
+    /// every valid copy gets its own unique rec. A key's partition is a fixed
+    /// function of the key, as in the pipeline.
+    fn random_chunks(rng: &mut Rng, parts: usize) -> Vec<EvChunk> {
+        let pool_size = 1 + rng.below(40) as usize;
+        let pool: Vec<IdKey> = (0..pool_size)
+            .map(|i| match i {
+                0 => 0,
+                1 => u64::MAX,
+                2 => 1u64 << 63,
+                _ => rng.next(),
+            })
+            .collect();
+        let ingest_span = 1 + rng.below(6) as u32;
+        let n_chunks = 1 + rng.below(4) as usize;
+        (0..n_chunks)
+            .map(|c| {
+                let n_toks = rng.below(120) as usize;
+                let mut by_part: Vec<Vec<Tok>> = vec![Vec::new(); parts];
+                let mut n_evs = 0u32;
+                for _ in 0..n_toks {
+                    let ekey = pool[rng.below(pool.len() as u64) as usize];
+                    let ingest_s = 1_000 + rng.below(u64::from(ingest_span)) as u32;
+                    let r = if rng.below(5) == 0 {
+                        NONE
+                    } else {
+                        n_evs += 1;
+                        rec(c as u32, n_evs - 1)
+                    };
+                    by_part[(fmix64(ekey) % parts as u64) as usize].push(Tok { ekey, ingest_s, rec: r });
+                }
+                // Shuffle within each partition so copy order is arbitrary.
+                for toks in &mut by_part {
+                    for i in (1..toks.len()).rev() {
+                        let j = rng.below(i as u64 + 1) as usize;
+                        toks.swap(i, j);
+                    }
+                }
+                let mut tok_off = vec![0u32];
+                let mut toks = Vec::new();
+                for part in by_part {
+                    toks.extend(part);
+                    tok_off.push(toks.len() as u32);
+                }
+                let mut chunk = chunk_with(n_evs as usize);
+                chunk.toks = toks;
+                chunk.tok_off = tok_off;
+                chunk
+            })
+            .collect()
+    }
+
+    /// A fresh copy of `chunks` with every dead bit cleared.
+    fn reset(chunks: &[EvChunk]) -> Vec<EvChunk> {
+        chunks
+            .iter()
+            .map(|c| EvChunk {
+                evs: c.evs.clone(),
+                ev_off: c.ev_off.clone(),
+                toks: c.toks.clone(),
+                tok_off: c.tok_off.clone(),
+                dead: (0..c.dead.len()).map(|_| AtomicU64::new(0)).collect(),
+            })
+            .collect()
+    }
+
+    fn dead_bits(chunks: &[EvChunk]) -> Vec<Vec<u64>> {
+        chunks
+            .iter()
+            .map(|c| c.dead.iter().map(|w| w.load(Ordering::Relaxed)).collect())
+            .collect()
+    }
+
+    /// Run the sort path and the streaming kernel on the same chunks and
+    /// compare the dead bitmaps exactly. Returns the streaming kernel's
+    /// "handled" flag for every partition.
+    fn diff_against_sorted(chunks: &[EvChunk], parts: usize, scratch: &mut DedupScratch, cap: usize) -> bool {
+        let sorted = reset(chunks);
+        for p in 0..parts {
+            dedup_partition_sorted(&sorted, p, K);
+        }
+        let streamed = reset(chunks);
+        let mut all_streamed = true;
+        for p in 0..parts {
+            all_streamed &= dedup_stream(&streamed, p, K, scratch, cap);
+        }
+        assert_eq!(dead_bits(&sorted), dead_bits(&streamed));
+        all_streamed
+    }
+
+    #[test]
+    fn streaming_dedup_matches_sort_path_randomized() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut scratch = DedupScratch::default();
+        let mut some_killed = false;
+        for _ in 0..3_000 {
+            let parts = 1 + rng.below(4) as usize;
+            let chunks = random_chunks(&mut rng, parts);
+            assert!(diff_against_sorted(&chunks, parts, &mut scratch, DEDUP_SCRATCH_BYTES));
+            // Sanity: the generator really produces kills.
+            let s = reset(&chunks);
+            (0..parts).for_each(|p| dedup_partition_sorted(&s, p, K));
+            some_killed |= dead_bits(&s).iter().flatten().any(|&w| w != 0);
+        }
+        assert!(some_killed);
+    }
+
+    #[test]
+    fn streaming_dedup_handles_none_winner_and_ties() {
+        // Event 7: a NONE copy strictly earliest kills both valid copies.
+        // Event 8: three valid copies tied on ingest - exactly one survives.
+        // Event 9: a valid and a NONE copy tied on ingest - the valid one wins.
+        let mut chunk = chunk_with(6);
+        chunk.toks = vec![
+            Tok { ekey: 7, ingest_s: 200, rec: rec(0, 0) },
+            Tok { ekey: 8, ingest_s: 50, rec: rec(0, 3) },
+            Tok { ekey: 7, ingest_s: 100, rec: NONE },
+            Tok { ekey: 8, ingest_s: 50, rec: rec(0, 1) },
+            Tok { ekey: 7, ingest_s: 300, rec: rec(0, 2) },
+            Tok { ekey: 8, ingest_s: 50, rec: rec(0, 4) },
+            Tok { ekey: 9, ingest_s: 10, rec: rec(0, 5) },
+            Tok { ekey: 9, ingest_s: 10, rec: NONE },
+        ];
+        chunk.tok_off = vec![0, chunk.toks.len() as u32];
+        let chunks = vec![chunk];
+        let mut scratch = DedupScratch::default();
+        assert!(dedup_stream(&chunks, 0, K, &mut scratch, DEDUP_SCRATCH_BYTES));
+        assert!(dead(&chunks, 0, 0) && dead(&chunks, 0, 2)); // NONE winner kills all
+        assert!(!dead(&chunks, 0, 1)); // smallest rec among the ingest tie wins
+        assert!(dead(&chunks, 0, 3) && dead(&chunks, 0, 4));
+        assert!(!dead(&chunks, 0, 5)); // valid beats NONE on an ingest tie
+        assert!(diff_against_sorted(&chunks, 1, &mut scratch, DEDUP_SCRATCH_BYTES));
+    }
+
+    #[test]
+    fn streaming_dedup_falls_back_before_marking() {
+        let mut rng = Rng(42);
+        let mut scratch = DedupScratch::default();
+        let mut fell_back = false;
+        for _ in 0..200 {
+            let parts = 1 + rng.below(3) as usize;
+            let chunks = random_chunks(&mut rng, parts);
+            // Too small for anything but an empty partition.
+            let fresh = reset(&chunks);
+            for p in 0..parts {
+                let n: u32 = fresh.iter().map(|c| c.tok_off[p + 1] - c.tok_off[p]).sum();
+                let handled = dedup_stream(&fresh, p, K, &mut scratch, WIN_SLOT_BYTES - 1);
+                assert_eq!(handled, n == 0);
+                fell_back |= !handled;
+            }
+            assert!(dead_bits(&fresh).iter().flatten().all(|&w| w == 0), "marked before falling back");
+            // The wrapper with the tiny cap must still give the exact answer.
+            let sorted = reset(&chunks);
+            let wrapped = reset(&chunks);
+            for p in 0..parts {
+                dedup_partition_sorted(&sorted, p, K);
+                dedup_partition_with(&wrapped, p, K, &mut scratch, WIN_SLOT_BYTES - 1);
+            }
+            assert_eq!(dead_bits(&sorted), dead_bits(&wrapped));
+        }
+        assert!(fell_back);
+    }
+
+    #[test]
+    fn streaming_dedup_survives_epoch_wrap() {
+        let mut rng = Rng(7);
+        let mut scratch = DedupScratch::default();
+        // Leave stale stamps at epoch 1 from one dataset ...
+        while scratch.epoch == 0 {
+            let first = random_chunks(&mut rng, 1);
+            diff_against_sorted(&first, 1, &mut scratch, DEDUP_SCRATCH_BYTES);
+        }
+        assert_eq!(scratch.epoch, 1);
+        // ... then wrap: the next live epoch is 1 again, so those stamps must
+        // have been cleared or they would read as occupied slots.
+        scratch.epoch = u32::MAX - 3;
+        for _ in 0..50 {
+            let parts = 1 + rng.below(3) as usize;
+            let chunks = random_chunks(&mut rng, parts);
+            assert!(diff_against_sorted(&chunks, parts, &mut scratch, DEDUP_SCRATCH_BYTES));
+        }
+        assert!(scratch.epoch < 100, "epoch wrapped");
     }
 
     #[test]

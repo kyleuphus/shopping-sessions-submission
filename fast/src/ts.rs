@@ -380,6 +380,22 @@ fn parse_ts_uncached(b: &[u8]) -> Option<i64> {
 /// dispatch entirely; it shares all validation with [`parse_ts`], so the two cannot drift.
 #[inline]
 pub fn parse_ingest_ts(b: &[u8]) -> Option<i64> {
+    parse_ingest_ts_with(current_cache(), b)
+}
+
+#[inline(always)]
+fn parse_ingest_ts_with(cache: Option<&DateCache>, b: &[u8]) -> Option<i64> {
+    if b.len() != F1_LEN || b[19] != b'Z' {
+        return None;
+    }
+    match cached_civil(cache, b) {
+        Some(result) => result,
+        None => parse_civil(b).map(|(ms, _)| ms),
+    }
+}
+
+#[cfg(test)]
+fn parse_ingest_ts_scalar(b: &[u8]) -> Option<i64> {
     if b.len() != F1_LEN || b[19] != b'Z' {
         return None;
     }
@@ -1501,6 +1517,91 @@ mod tests {
         fn below(&mut self, n: u64) -> u64 {
             self.next() % n
         }
+    }
+
+    fn f1_at(day: i64, seconds: u64) -> [u8; F1_LEN] {
+        let (year, month, date) = civil_from_days(day);
+        let hour = seconds / 3600;
+        let min = seconds / 60 % 60;
+        let sec = seconds % 60;
+        format!("{year:04}-{month:02}-{date:02}T{hour:02}:{min:02}:{sec:02}Z")
+            .into_bytes()
+            .try_into()
+            .unwrap()
+    }
+
+    #[test]
+    fn ingest_scalar_differential() {
+        let mut rng = Rng(0xd1b5_4a32_d192_ed03);
+        for start in [
+            days_from_civil(2026, 10, 1),
+            days_from_civil(2028, 2, 20),
+            days_from_civil(2000, 2, 20),
+            days_from_civil(2100, 2, 20),
+            days_from_civil(1969, 12, 24),
+        ] {
+            set_window_hint(start * MS_PER_DAY, (start + 14) * MS_PER_DAY);
+            let check = |b: &[u8]| {
+                let expected = parse_ingest_ts_scalar(b);
+                assert_eq!(parse_ingest_ts_with(None, b), expected, "no hint: {b:?}");
+                assert_eq!(parse_ingest_ts(b), expected, "with hint: {b:?}");
+                if expected.is_some() {
+                    assert_eq!(parse_ts(b), expected, "valid F1: {b:?}");
+                }
+            };
+
+            for i in 0..80 {
+                // Walk every date in the window (including leap days), then
+                // also exercise random dates outside the cache's margins.
+                let offset = if i < 14 { i } else { rng.below(60) as i64 - 20 };
+                let mut input = f1_at(start + offset, rng.below(86_400));
+                check(&input);
+                for pos in 0..F1_LEN {
+                    let original = input[pos];
+                    for byte in 0..=255 {
+                        if byte != original {
+                            input[pos] = byte;
+                            check(&input);
+                        }
+                    }
+                    input[pos] = original;
+
+                    let mut shorter = input;
+                    shorter.copy_within(pos + 1.., pos);
+                    check(&shorter[..F1_LEN - 1]);
+
+                    let mut longer = [0; F1_LEN + 1];
+                    longer[..pos].copy_from_slice(&input[..pos]);
+                    longer[pos] = rng.next() as u8;
+                    longer[pos + 1..].copy_from_slice(&input[pos..]);
+                    check(&longer);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "microbenchmark: ten million ingest timestamp parses"]
+    fn ingest_cost_probe() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        const COUNT: usize = 10_000_000;
+        let start = days_from_civil(2026, 10, 1);
+        set_window_hint(start * MS_PER_DAY, (start + 14) * MS_PER_DAY);
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let inputs: Vec<_> = (0..4_000)
+            .map(|_| f1_at(start + rng.below(14) as i64, rng.below(86_400)))
+            .collect();
+
+        let started = Instant::now();
+        for input in inputs.iter().cycle().take(COUNT) {
+            black_box(parse_ingest_ts(black_box(input.as_slice())));
+        }
+        eprintln!(
+            "ingest_cost_probe: {:.3} ns/call",
+            started.elapsed().as_nanos() as f64 / COUNT as f64
+        );
     }
 
     #[test]

@@ -146,13 +146,22 @@ pub fn for_each_record<'a, const N: usize>(bytes: &'a [u8], skip_header: bool, m
             // iff every quote in it was one end of such a pair, i.e. iff the
             // stripped pairs account for all `quotes` quote bytes. Any other
             // quote (lone, inside, at one end only) leaves the counts unequal.
+            //
+            // Branch-free: the wrap test is a coin flip on real data (~20% of
+            // fields quoted), so compute it as an integer w in {0,1} and always
+            // re-slice to `[w..n-w]`. `first()`/`last()` with `unwrap_or(0)`
+            // never read out of bounds (an empty field yields 0, not a quote)
+            // and lower to selects; `n >= 2` rules out a lone `"` counting as
+            // both ends. When w == 1, n >= 2 so `n - w >= w` and the slice is
+            // valid; when w == 0 it is the whole field.
             let mut stripped = 0u32;
             for field in fields.iter_mut() {
                 let n = field.len();
-                if n >= 2 && field[0] == b'"' && field[n - 1] == b'"' {
-                    *field = &field[1..n - 1];
-                    stripped += 2;
-                }
+                let first = field.first().copied().unwrap_or(0);
+                let last = field.last().copied().unwrap_or(0);
+                let w = usize::from(n >= 2) & usize::from(first == b'"') & usize::from(last == b'"');
+                *field = &field[w..n - w];
+                stripped += 2 * w as u32;
             }
             if stripped != quotes {
                 return; // a quote not wrapping a whole field: malformed
@@ -283,11 +292,108 @@ mod tests {
             b"h\n\"a,b\",c,d\n\"a\"b\",c,d,e\n a ,b ,c\r,d\r\n",
             b"h\"x\nq\"\",b,c,d\n\"\"\"\",b,c,d\n\"a,b,c,\"",
             b"no newline header",
+            // Empty / lone-quote fields at EOF with no trailing newline.
+            b"h\na,b,c,\"\"",
+            b"h\na,b,c,\"",
+            b"h\na,b,c,",
+            b"h\n\"\"",
+            b"h\n\"",
+            b"h\n\"\"\"\"",
+            b"h\n\"\"\"\",b,c,d",
+            b"h\n\",\",\",\"",
+            b"h\n\"\",\"\",\"\",\"\"",
+            b"h\n\"\",\"\",\"\",\"\",\"\",\"\",\"\"",
+            b"h\n\",b,c,d\n",
+            b"h\na,b,c,\"\n",
         ] {
             check::<4>(case);
             check::<7>(case);
             check::<1>(case);
         }
+    }
+
+    /// Quoted fields whose quotes straddle 64-byte block boundaries: lines of
+    /// every length 62..=130 with quoted first and/or last fields, preceded by
+    /// a prefix that shifts the line so quotes land at bytes 63/64, 127/128.
+    /// Also lines ending exactly at the buffer end (no `\n`) with an empty or
+    /// quoted-empty last field.
+    #[test]
+    fn block_boundary_quotes() {
+        let mut cases: Vec<Vec<u8>> = Vec::new();
+        // Field opening quote at byte 63, closing quote at byte 64.
+        let mut b = vec![b'x'; 62];
+        b.push(b'\n'); // line 1 = bytes 0..62, newline at 62
+        b.extend_from_slice(b"\"\",b,c,d\n"); // `"` at 63 and 64
+        cases.push(b.clone());
+        let mut b = vec![b'x'; 63];
+        b.extend_from_slice(b",b,\"c\""); // last field `"c"` with quotes at 66 and 68
+        cases.push(b);
+        let mut b = Vec::new();
+        b.extend_from_slice(&[b'a'; 60]);
+        b.extend_from_slice(b",b,\"c\",\"d\""); // quotes near/over 64
+        cases.push(b);
+        for prefix in [0usize, 1, 2, 3, 30, 61, 62, 63] {
+            for line_len in 62usize..=130 {
+                for (qfirst, qlast, nl) in [(true, false, true), (false, true, true), (true, true, true), (true, true, false), (false, true, false)] {
+                    for n in [4usize, 7] {
+                        let mut buf = Vec::new();
+                        if prefix > 0 {
+                            buf.extend(std::iter::repeat(b'p').take(prefix - 1));
+                            buf.push(b'\n');
+                        }
+                        // Fields: first and last get the padding, middle are short.
+                        let fixed = (n - 1) + (n - 2) + 2 * usize::from(qfirst) + 2 * usize::from(qlast);
+                        let pad = line_len.saturating_sub(fixed);
+                        let (pf, pl) = (pad / 2, pad - pad / 2);
+                        if qfirst {
+                            buf.push(b'"');
+                        }
+                        buf.extend(std::iter::repeat(b'f').take(pf));
+                        if qfirst {
+                            buf.push(b'"');
+                        }
+                        for _ in 0..n - 2 {
+                            buf.extend_from_slice(b",m");
+                        }
+                        buf.push(b',');
+                        if qlast {
+                            buf.push(b'"');
+                        }
+                        buf.extend(std::iter::repeat(b'l').take(pl));
+                        if qlast {
+                            buf.push(b'"');
+                        }
+                        if nl {
+                            buf.push(b'\n');
+                        }
+                        cases.push(buf.clone());
+                        // Same line twice, plus a trailing line ending exactly at
+                        // buffer end with an empty / `""` / `"` last field.
+                        let body = buf.clone();
+                        for tail in [&b"a,b,c,"[..], b"a,b,c,\"\"", b"a,b,c,\"", b"\"\""] {
+                            let mut c = body.clone();
+                            if !nl {
+                                c.push(b'\n');
+                            }
+                            c.extend_from_slice(&body);
+                            if !nl {
+                                c.push(b'\n');
+                            }
+                            c.extend_from_slice(tail);
+                            cases.push(c);
+                        }
+                    }
+                }
+            }
+        }
+        let mut accepted = 0usize;
+        for c in &cases {
+            check::<4>(c);
+            check::<7>(c);
+            check::<1>(c);
+            accepted += scanned::<4>(c, false).len() + scanned::<7>(c, false).len();
+        }
+        assert!(accepted > 1000, "only {accepted} accepted records");
     }
 
     /// Randomised adversarial lines: quotes in odd places, `\r`, spaces,
@@ -311,6 +417,14 @@ mod tests {
             let mut buf = Vec::new();
             let lines = 1 + next() % 12;
             for _ in 0..lines {
+                // Sometimes pad so the next line starts a few bytes before a
+                // 64-byte block edge, so its opening quote / commas straddle it.
+                if next() % 3 == 0 {
+                    let target = 64 - (1 + (next() % 4) as usize); // start at 60..63 mod 64
+                    let fill = (target + 64 - (buf.len() + 1) % 64) % 64;
+                    buf.extend(std::iter::repeat(b'z').take(fill));
+                    buf.push(b'\n');
+                }
                 // Mostly well-formed-ish lines with N-1 commas, sometimes noise.
                 let n = [4usize, 7][(next() % 2) as usize];
                 let noisy = next() % 4 == 0;
