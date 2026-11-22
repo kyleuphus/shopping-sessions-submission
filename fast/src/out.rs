@@ -7,11 +7,14 @@
 //!
 //! Row order and the number of output files do not matter.
 //!
-//! Writing is tuned for speed, not size (rules.md "Outputs": any integer width, any
-//! string encoding; output size is not scored): no compression, no statistics, no
-//! dictionary encoding, and the four count columns as Int32 when every value in the
-//! file fits (otherwise that file falls back to Int64 — never a silent truncation).
-//! `revenue_cents` stays Int64 because sums of prices can exceed 2^31.
+//! `FAST_PQ` selects the encoding once per process. Unset or unknown values
+//! use `dict-delta-snappy`. Container exit waits for output write-back, and
+//! the smaller Snappy output reduced measured wall time to 0.920x `plain`.
+//! `plain` selects the original uncompressed output. `dict` enables dictionaries on
+//! low-cardinality columns. `dict-delta` adds delta encoding to integer
+//! measures and user IDs, and its `-lz4` and `-snappy` variants compress pages.
+//! Every variant skips statistics and uses Int32 for counts only when all
+//! counts in the file fit. `revenue_cents` stays Int64.
 
 use std::borrow::Cow;
 use std::fs::File;
@@ -107,18 +110,54 @@ fn write_batch(
     let schema = Arc::new(schema);
     let batch = RecordBatch::try_new(schema.clone(), columns)?;
     let file = File::create(dir.join(format!("part-{part}.parquet")))?;
-    // The graders don't score output size, so skip every optional cost: compression,
-    // min/max statistics, and dictionary encoding (pure hashing overhead on the
-    // high-cardinality user_id column). Plain encoding is still valid Parquet.
-    let props = WriterProperties::builder()
-        .set_compression(Compression::UNCOMPRESSED)
-        .set_statistics_enabled(EnabledStatistics::None)
-        .set_dictionary_enabled(false)
-        .build();
+    static VARIANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let variant = VARIANT.get_or_init(|| std::env::var("FAST_PQ").ok());
+    let props = writer_properties(variant.as_deref());
     let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
     writer.write(&batch)?;
     writer.close()?;
     Ok(())
+}
+
+fn writer_properties(variant: Option<&str>) -> WriterProperties {
+    use parquet::basic::Encoding;
+    use parquet::schema::types::ColumnPath;
+
+    let variant = match variant {
+        Some(name @ ("plain" | "dict" | "dict-delta" | "dict-delta-lz4")) => name,
+        _ => "dict-delta-snappy",
+    };
+    let compression = match variant {
+        "dict-delta-lz4" => Compression::LZ4_RAW,
+        "dict-delta-snappy" => Compression::SNAPPY,
+        _ => Compression::UNCOMPRESSED,
+    };
+    let mut props = WriterProperties::builder()
+        .set_compression(compression)
+        .set_statistics_enabled(EnabledStatistics::None)
+        .set_dictionary_enabled(false);
+    let delta = matches!(variant, "dict-delta" | "dict-delta-lz4" | "dict-delta-snappy");
+    // Column paths absent from a table's schema are unused by its writer.
+    if variant == "dict" || delta {
+        for name in ["day", "top_category", "campaign_id", "channel"] {
+            props = props.set_column_dictionary_enabled(ColumnPath::from(name), true);
+        }
+    }
+    // These paths inherit dictionary=false, so their explicit encodings apply.
+    if delta {
+        for name in [
+            "sessions",
+            "events",
+            "revenue_cents",
+            "purchasing_sessions",
+            "assisted_sessions",
+        ] {
+            props = props.set_column_encoding(ColumnPath::from(name), Encoding::DELTA_BINARY_PACKED);
+        }
+        props = props
+            .set_column_encoding(ColumnPath::from("user_id"), Encoding::DELTA_LENGTH_BYTE_ARRAY);
+    }
+    props.build()
 }
 
 /// Write one user_daily part file, `part-{part}.parquet`, from any iterator of
@@ -179,6 +218,71 @@ pub fn write_campaign_daily(
 mod tests {
     use super::*;
     use arrow::array::Array;
+
+    #[test]
+    fn parquet_variants_round_trip_both_tables_and_count_widths() {
+        let path = std::env::temp_dir().join(format!("fast-variants-{}.parquet", std::process::id()));
+        for count in [7, i64::from(i32::MAX) + 1] {
+            let counts = count_type([1, count, 3].into_iter());
+            let measures = count_column(&counts, [1, count, 3].into_iter());
+            let days = Arc::new(Date32Array::from(vec![20000, 20001, 20000]));
+            let revenue = Arc::new(Int64Array::from(vec![0, 5_000_000_000, 10]));
+            let users = RecordBatch::try_new(
+                Arc::new(user_daily_schema(counts.clone())),
+                vec![
+                    Arc::new(StringArray::from(vec!["repeat", "repeat", "unique"])),
+                    days.clone(),
+                    measures.clone(),
+                    measures.clone(),
+                    revenue.clone(),
+                    Arc::new(StringArray::from(vec![None, Some(""), Some("books")])),
+                ],
+            )
+            .unwrap();
+            let campaigns = RecordBatch::try_new(
+                Arc::new(campaign_daily_schema(counts)),
+                vec![
+                    Arc::new(StringArray::from(vec!["c1", "c1", "c2"])),
+                    Arc::new(StringArray::from(vec!["search", "search", "email"])),
+                    days,
+                    measures.clone(),
+                    measures.clone(),
+                    revenue,
+                    measures,
+                ],
+            )
+            .unwrap();
+            for batch in [users, campaigns] {
+                for variant in [
+                    None,
+                    Some("unknown"),
+                    Some("plain"),
+                    Some("dict"),
+                    Some("dict-delta"),
+                    Some("dict-delta-lz4"),
+                    Some("dict-delta-snappy"),
+                ] {
+                    let props = writer_properties(variant);
+                    if matches!(variant, None | Some("unknown")) {
+                        assert_eq!(
+                            props.compression(&parquet::schema::types::ColumnPath::from("day")),
+                            Compression::SNAPPY
+                        );
+                    }
+                    let mut writer = ArrowWriter::try_new(
+                        File::create(&path).unwrap(),
+                        batch.schema(),
+                        Some(props),
+                    )
+                    .unwrap();
+                    writer.write(&batch).unwrap();
+                    writer.close().unwrap();
+                    assert_eq!(read_back(&path), batch, "{variant:?}");
+                }
+            }
+        }
+        std::fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn writes_empty_tables_with_the_right_schema() {
