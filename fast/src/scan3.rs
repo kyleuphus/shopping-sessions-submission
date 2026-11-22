@@ -118,6 +118,91 @@ pub fn for_each_record<'a, const N: usize>(
     fast: bool,
     mut f: impl FnMut(&[&'a [u8]; N]),
 ) {
+    for_each_row(bytes, skip_header, fast, None, |row: Fields<'a, '_, N>| match row.0 {
+        FieldRepr::Slices(fields) => f(fields),
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        FieldRepr::Spans { .. } => f(&std::array::from_fn(|k| row.get(k))),
+    });
+}
+
+/// A validated record. The AVX2 path can hand the parser sixteen-bit starts
+/// and lengths and let it form only the slices that it actually consumes.
+#[derive(Clone, Copy)]
+pub(crate) struct Fields<'a, 'r, const N: usize>(FieldRepr<'a, 'r, N>);
+
+#[derive(Clone, Copy)]
+enum FieldRepr<'a, 'r, const N: usize> {
+    Slices(&'r [&'a [u8]; N]),
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    Spans { bytes: &'a [u8], starts: &'r [u16; N], lengths: &'r [u16; N] },
+}
+
+impl<'a, const N: usize> Fields<'a, '_, N> {
+    #[inline(always)]
+    pub(crate) fn get(self, k: usize) -> &'a [u8] {
+        match self.0 {
+            FieldRepr::Slices(fields) => fields[k],
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            FieldRepr::Spans { bytes, starts, lengths } => {
+                let start = starts[k] as usize;
+                let len = lengths[k] as usize;
+                // SAFETY: the scanner creates Spans only from validated
+                // delimiter offsets and exposes exactly the N valid lanes.
+                unsafe { bytes.get_unchecked(start..start + len) }
+            }
+        }
+    }
+
+    #[inline(always)]
+    pub(crate) fn observe(self) {
+        match self.0 {
+            FieldRepr::Slices(fields) => { std::hint::black_box(fields); }
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+            FieldRepr::Spans { bytes, starts, lengths } => {
+                std::hint::black_box((bytes.as_ptr(), starts, lengths));
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScanStats {
+    pub(crate) fast_batches: usize,
+    pub(crate) fallback_batches: usize,
+    pub(crate) fast_records: usize,
+    pub(crate) fallback_records: usize,
+}
+
+impl ScanStats {
+    pub(crate) fn merge(&mut self, other: Self) {
+        self.fast_batches += other.fast_batches;
+        self.fallback_batches += other.fallback_batches;
+        self.fast_records += other.fast_records;
+        self.fallback_records += other.fallback_records;
+    }
+
+    fn batch(&mut self, fast_records: usize, recovered: &[u8]) {
+        self.fast_records += fast_records;
+        if recovered.is_empty() {
+            self.fast_batches += 1;
+        } else {
+            self.fallback_batches += 1;
+            // Count input rows, including malformed ones and a final row
+            // without a newline. Only the rare recovered span is reread.
+            self.fallback_records += memchr::memchr_iter(b'\n', recovered).count()
+                + usize::from(recovered.last() != Some(&b'\n'));
+        }
+    }
+}
+
+#[inline]
+pub(crate) fn for_each_row<'a, const N: usize>(
+    bytes: &'a [u8],
+    skip_header: bool,
+    fast: bool,
+    stats: Option<&mut ScanStats>,
+    mut f: impl FnMut(Fields<'a, '_, N>),
+) {
     assert!(N >= 1 && N <= 16);
     let buf = if skip_header {
         match memchr::memchr(b'\n', bytes) {
@@ -128,9 +213,9 @@ pub fn for_each_record<'a, const N: usize>(
         bytes
     };
     if fast && cfg!(target_endian = "little") && (N == 4 || N == 7) {
-        scan_batches(buf, &mut f);
+        scan_batches(buf, stats, &mut f);
     } else {
-        scan_legacy(buf, &mut f);
+        scan_legacy(buf, &mut |fields| f(Fields(FieldRepr::Slices(fields))));
     }
 }
 
@@ -258,8 +343,8 @@ fn scan_legacy<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(&[&'a [u8];
 // Keep uncommon batch recovery out of the scanner's and caller's hot loops.
 #[cold]
 #[inline(never)]
-fn recover_batch<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(&[&'a [u8]; N])) {
-    scan_legacy(buf, f);
+fn recover_batch<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(Fields<'a, '_, N>)) {
+    scan_legacy(buf, &mut |fields| f(Fields(FieldRepr::Slices(fields))));
 }
 
 // Offset entries contain the delimiter position plus one (relative to the
@@ -267,7 +352,7 @@ fn recover_batch<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(&[&'a [u8
 const NEWLINE: u16 = 1 << 15;
 const BATCH_WORDS: usize = 16;
 const MAX_WORDS: usize = 24;
-const OFFSETS_CAPACITY: usize = MAX_WORDS * 64 + 8;
+const OFFSETS_CAPACITY: usize = MAX_WORDS * 64 + 16;
 const _: () = assert!(MAX_WORDS * 64 + 1 < (NEWLINE as usize >> 1));
 
 #[inline(always)]
@@ -300,7 +385,21 @@ fn quote_parity(quotes: u64) -> u64 {
         // SAFETY: AES/PMULL is enabled at compile time.
         return unsafe { std::arch::aarch64::vmull_p64(quotes, u64::MAX) as u64 };
     }
-    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    #[cfg(all(target_arch = "x86_64", target_feature = "pclmulqdq"))]
+    {
+        use std::arch::x86_64::*;
+        // SAFETY: PCLMULQDQ is enabled by the scorer build flags. As with
+        // PMULL above, the low half is the prefix XOR across all 64 bits.
+        return unsafe {
+            _mm_cvtsi128_si64(_mm_clmulepi64_si128::<0>(
+                _mm_cvtsi64_si128(quotes as i64), _mm_set1_epi64x(-1),
+            )) as u64
+        };
+    }
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_feature = "aes"),
+        all(target_arch = "x86_64", target_feature = "pclmulqdq"),
+    )))]
     {
         let mut quotes = quotes ^ (quotes << 1);
         quotes ^= quotes << 2;
@@ -309,6 +408,108 @@ fn quote_parity(quotes: u64) -> u64 {
         quotes ^= quotes << 16;
         quotes ^ (quotes << 32)
     }
+}
+
+// In each 16-byte quarter, encode up to four delimiter positions as bytes.
+// The last byte's high nibble holds their count. Its sign bit instead marks a
+// dense quarter, which the general offset writer can handle.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+const fn offset_quarter() -> [u32; 1 << 16] {
+    let mut table = [0; 1 << 16];
+    let mut mask = 1;
+    while mask < table.len() {
+        let mut bits = mask;
+        let count = bits.count_ones();
+        let mut packed = 1 << 31;
+        if count <= 4 {
+            packed = count << 28;
+            let mut shift = 0;
+            while bits != 0 {
+                packed |= bits.trailing_zeros() << shift;
+                bits &= bits - 1;
+                shift += 8;
+            }
+        }
+        table[mask] = packed;
+        mask += 1;
+    }
+    table
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+static OFFSET_QUARTER: [u32; 1 << 16] = offset_quarter();
+
+// Shuffle the four packed quarters into a single list. Nothing ever follows
+// the fourth quarter, so the shuffle only needs the first three counts.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+const fn quarter_shuffle() -> [[i8; 16]; 512] {
+    let mut table = [[-1; 16]; 512];
+    let mut key = 0;
+    while key < table.len() {
+        let mut quarter = 0;
+        let mut dst = 0;
+        while quarter < 4 {
+            let count = if quarter == 3 { 4 } else { (key >> (3 * quarter)) & 7 };
+            let mut lane = 0;
+            while lane < count && lane < 4 {
+                table[key][dst] = (4 * quarter + lane) as i8;
+                dst += 1;
+                lane += 1;
+            }
+            quarter += 1;
+        }
+        key += 1;
+    }
+    table
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+static QUARTER_SHUFFLE: [[i8; 16]; 512] = quarter_shuffle();
+
+/// Avoid eight serial bit removals and two variable shifts per delimiter.
+/// Load positions independently by quarter, then extract and deposit each
+/// flag mask once in delimiter order. Cascade Lake executes PEXT/PDEP in
+/// hardware. The position tables fit in its private L2.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+#[inline(always)]
+fn append_offsets_x86(
+    offsets: &mut [u16],
+    count: usize,
+    delimiters: u64,
+    relative_base: usize,
+    closing: u64,
+    newline: u64,
+) -> usize {
+    use std::arch::x86_64::*;
+    let n = delimiters.count_ones() as usize;
+    let a = OFFSET_QUARTER[delimiters as u16 as usize];
+    let b = OFFSET_QUARTER[(delimiters >> 16) as u16 as usize];
+    let c = OFFSET_QUARTER[(delimiters >> 32) as u16 as usize];
+    let d = OFFSET_QUARTER[(delimiters >> 48) as usize];
+    if n > 8 || ((a | b | c | d) >> 31 != 0) {
+        return append_offsets(offsets, count, delimiters, relative_base, closing, newline);
+    }
+
+    // SAFETY: AVX2 and BMI2 are enabled. Each count is in 0..=4, so the
+    // shuffle key fits. As in append_offsets, there are eight spare slots.
+    let key = ((a >> 28) | ((b >> 28) << 3) | ((c >> 28) << 6)) as usize;
+    debug_assert!(count + 8 <= offsets.len());
+    unsafe {
+        let input = _mm_setr_epi32(a as i32, b as i32, c as i32, d as i32);
+        let input = _mm_or_si128(
+            _mm_and_si128(input, _mm_set1_epi8(15)),
+            _mm_setr_epi32(0, 0x1010_1010, 0x2020_2020, 0x3030_3030),
+        );
+        let shuffle = _mm_loadu_si128(QUARTER_SHUFFLE.get_unchecked(key).as_ptr().cast());
+        let positions = _mm_cvtepu8_epi16(_mm_shuffle_epi8(input, shuffle));
+        let base = _mm_set1_epi16((relative_base as u16).wrapping_mul(2) as i16);
+        let positions = _mm_add_epi16(_mm_slli_epi16::<1>(positions), base);
+        let quotes = _pdep_u64(_pext_u64(closing, delimiters), 0x0101_0101_0101_0101);
+        let lines = _pdep_u64(_pext_u64(newline, delimiters), 0x8080_8080_8080_8080);
+        let flags = _mm_unpacklo_epi8(_mm_cvtsi64_si128(quotes as i64), _mm_cvtsi64_si128(lines as i64));
+        _mm_storeu_si128(offsets.as_mut_ptr().add(count).cast(), _mm_or_si128(positions, flags));
+    }
+    count + n
 }
 
 // Gather the mask byte for each delimiter, then shift the selected bit to
@@ -338,7 +539,7 @@ fn tag_offsets_neon(positions: [u8; 8], base: u16, closing: u64, newline: u64) -
 /// flags with them. Every extra slot written by the unrolled path is ignored.
 #[inline(always)]
 fn append_offsets(
-    offsets: &mut [u16; OFFSETS_CAPACITY],
+    offsets: &mut [u16],
     count: usize,
     mut delimiters: u64,
     relative_base: usize,
@@ -380,19 +581,27 @@ fn append_offsets(
 }
 
 #[inline]
-fn scan_batches<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(&[&'a [u8]; N])) {
+fn scan_batches<'a, const N: usize>(
+    buf: &'a [u8],
+    mut stats: Option<&mut ScanStats>,
+    f: &mut impl FnMut(Fields<'a, '_, N>),
+) {
     if buf.is_empty() {
         return;
     }
     // Every processed byte can contribute at most one offset, including EOF.
     // Extra entries permit the rounded-up writes and reads of eight offsets.
     let mut offsets = [0u16; OFFSETS_CAPACITY];
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    let mut spans = BatchSpans::new();
     let mut start = 0;
     let mut base = 0;
     let mut masks = read_masks(buf, 0);
     let (mut prev_delimiter, mut prev_quote) = (1, 0);
     'batch: while start < buf.len() {
-        let mut count = 0;
+        // The extra zero before the first delimiter is the first field's
+        // untrimmed start. The AVX2 normalizer slides its loads past it.
+        let mut count = 1;
         let mut bad = 0;
         let mut parity = 0;
         let mut active = u64::MAX << (start - base);
@@ -406,7 +615,11 @@ fn scan_batches<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(&[&'a [u8]
                 let next = (base + 64).min(buf.len());
                 let end = memchr::memchr(b'\n', &buf[next..])
                     .map_or(buf.len(), |nl| next + nl + 1);
-                recover_batch(&buf[start..end], f);
+                let batch = &buf[start..end];
+                if let Some(stats) = stats.as_deref_mut() {
+                    stats.batch(0, batch);
+                }
+                recover_batch(batch, f);
                 if end == buf.len() {
                     return;
                 }
@@ -443,15 +656,26 @@ fn scan_batches<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(&[&'a [u8]
             // On the cached first word, base can precede start. All actual
             // offsets are positive because delimiters excludes that prefix.
             let relative_base = (base + 1).wrapping_sub(start);
-            count = append_offsets(
+            #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+            let append = append_offsets_x86;
+            #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2")))]
+            let append = append_offsets;
+            count = append(
                 &mut offsets, count, delimiters, relative_base, closing, masks.newline,
             );
 
             if seal {
+                let batch = &buf[start..end];
                 if bad == 0 {
-                    emit_batch(&buf[start..end], &offsets, count, f);
+                    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+                    spans.emit(batch, &offsets, count - 1, stats.as_deref_mut(), f);
+                    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+                    emit_batch(batch, &offsets[1..], count - 1, stats.as_deref_mut(), f);
                 } else {
-                    recover_batch(&buf[start..end], f);
+                    if let Some(stats) = stats.as_deref_mut() {
+                        stats.batch(0, batch);
+                    }
+                    recover_batch(batch, f);
                 }
                 if end == buf.len() {
                     return;
@@ -479,9 +703,92 @@ fn scan_batches<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(&[&'a [u8]
     }
 }
 
-// To construct all field slices together, shift the original ends one lane
-// right to get the starts, then use each closing-quote flag to trim both ends.
-// The position-plus-one encoding makes the previous end the next raw start.
+// The expected sign bits of sixteen consecutive offsets. Bit 2*i+1 is the
+// high byte of lane i in the AVX2 movemask. Use one constant per block so the
+// seven-field schema does not need a modulo in the hot loop.
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+const fn newline_pattern<const N: usize>() -> [u32; OFFSETS_CAPACITY / 16] {
+    let mut patterns = [0; OFFSETS_CAPACITY / 16];
+    let mut i = N - 1;
+    while i < OFFSETS_CAPACITY {
+        patterns[i / 16] |= 1 << (2 * (i % 16) + 1);
+        i += N;
+    }
+    patterns
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+struct BatchSpans {
+    starts: [u16; OFFSETS_CAPACITY],
+    lengths: [u16; OFFSETS_CAPACITY],
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+impl BatchSpans {
+    fn new() -> Self {
+        Self { starts: [0; OFFSETS_CAPACITY], lengths: [0; OFFSETS_CAPACITY] }
+    }
+
+    #[inline(always)]
+    fn emit<'a, const N: usize>(
+        &mut self,
+        bytes: &'a [u8],
+        offsets: &[u16; OFFSETS_CAPACITY],
+        count: usize,
+        stats: Option<&mut ScanStats>,
+        f: &mut impl FnMut(Fields<'a, '_, N>),
+    ) {
+        use std::arch::x86_64::*;
+        debug_assert!(count > 0 && count + 16 <= offsets.len());
+        let patterns = const { &newline_pattern::<N>() };
+        let mut invalid = 0;
+        for i in (0..count).step_by(16) {
+            // SAFETY: AVX2 is enabled. Slot 0 is the sentinel, slots 1..=count
+            // are delimiters, and padding covers both loads and output stores.
+            unsafe {
+                let previous = _mm256_loadu_si256(offsets.as_ptr().add(i).cast());
+                let raw = _mm256_loadu_si256(offsets.as_ptr().add(i + 1).cast());
+                let marks = _mm256_movemask_epi8(raw) as u32;
+                let active = u32::MAX >> (2 * (16 - (count - i).min(16)));
+                invalid |= (marks ^ *patterns.get_unchecked(i / 16)) & 0xaaaa_aaaa & active;
+
+                let pos_mask = _mm256_set1_epi16(!NEWLINE as i16);
+                let prev = _mm256_srli_epi16::<1>(_mm256_and_si256(previous, pos_mask));
+                let end = _mm256_srli_epi16::<1>(_mm256_and_si256(raw, pos_mask));
+                let one = _mm256_set1_epi16(1);
+                let trim = _mm256_and_si256(raw, one);
+                let start = _mm256_add_epi16(prev, trim);
+                let length = _mm256_sub_epi16(_mm256_sub_epi16(end, start), _mm256_add_epi16(trim, one));
+                _mm256_storeu_si256(self.starts.as_mut_ptr().add(i).cast(), start);
+                _mm256_storeu_si256(self.lengths.as_mut_ptr().add(i).cast(), length);
+            }
+        }
+        if invalid != 0 {
+            if let Some(stats) = stats {
+                stats.batch(0, bytes);
+            }
+            recover_batch(bytes, f);
+            return;
+        }
+        // The last delimiter is a line break (or synthetic EOF). With the
+        // mark pattern validated, count is a multiple of N. The quote checks
+        // also passed, so the computed spans stay inside the original fields.
+        debug_assert_eq!(count % N, 0);
+        for i in (0..count).step_by(N) {
+            let (starts, lengths) = unsafe {
+                (&*self.starts.as_ptr().add(i).cast::<[u16; N]>(),
+                 &*self.lengths.as_ptr().add(i).cast::<[u16; N]>())
+            };
+            f(Fields(FieldRepr::Spans { bytes, starts, lengths }));
+        }
+        if let Some(stats) = stats {
+            stats.batch(count / N, &[]);
+        }
+    }
+}
+
+// The portable emitter normalizes one row at a time. Shifting the ends one
+// lane to the right forms the raw starts, then the quote bit trims both ends.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn normalize_offsets(input: *const u16, start: usize) -> ([u16; 8], [u16; 8]) {
@@ -496,7 +803,7 @@ unsafe fn normalize_offsets(input: *const u16, start: usize) -> ([u16; 8], [u16;
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3", not(target_feature = "avx2")))]
 #[inline(always)]
 unsafe fn normalize_offsets(input: *const u16, start: usize) -> ([u16; 8], [u16; 8]) {
     use std::arch::x86_64::*;
@@ -510,12 +817,14 @@ unsafe fn normalize_offsets(input: *const u16, start: usize) -> ([u16; 8], [u16;
     }
 }
 
+#[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
 #[inline(always)]
 fn emit_batch<'a, const N: usize>(
     buf: &'a [u8],
-    offsets: &[u16; OFFSETS_CAPACITY],
+    offsets: &[u16],
     count: usize,
-    f: &mut impl FnMut(&[&'a [u8]; N]),
+    stats: Option<&mut ScanStats>,
+    f: &mut impl FnMut(Fields<'a, '_, N>),
 ) {
     debug_assert!(N == 4 || N == 7);
     let mut start = 0;
@@ -559,12 +868,18 @@ fn emit_batch<'a, const N: usize>(
                 std::slice::from_raw_parts(buf.as_ptr().add(prev + trim), end - prev - 2 * trim)
             }
         });
+        f(Fields(FieldRepr::Slices(&fields)));
         start = ((unsafe { *ends.add(N - 1) } & !NEWLINE) >> 1) as usize;
-        f(&fields);
         i += N;
     }
     if i != count {
-        recover_batch(&buf[start..], f);
+        let rest = &buf[start..];
+        if let Some(stats) = stats {
+            stats.batch(i / N, rest);
+        }
+        recover_batch(rest, f);
+    } else if let Some(stats) = stats {
+        stats.batch(i / N, &[]);
     }
 }
 
@@ -631,6 +946,66 @@ mod tests {
             let (a, b) = (block_masks(&block), block_masks_scalar(&block));
             assert_eq!((a.comma, a.quote, a.newline), (b.comma, b.quote, b.newline));
         }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2", target_feature = "bmi2"))]
+    #[test]
+    fn packed_offsets_match_general_writer() {
+        for mask in 0..=u16::MAX {
+            let quarter = usize::from(mask & 3);
+            let sieve = !(0xffffu64 << (16 * quarter));
+            let sparse = sieve & 0x0040_0200_0100_0900;
+            let delimiters = sparse | (u64::from(mask) << (16 * quarter));
+            let closing = u64::from(mask).wrapping_mul(0x6007_001d_0004_002b);
+            let newline = closing.rotate_right(13) & delimiters;
+            // Also exercise a negative base for a block shared by two batches.
+            let relative_base = usize::from(mask & 31).wrapping_sub(16);
+            let (mut want, mut got) = ([0; 80], [0; 80]);
+            let len = append_offsets(&mut want, 1, delimiters, relative_base, closing, newline);
+            let fast_len = append_offsets_x86(&mut got, 1, delimiters, relative_base, closing, newline);
+            assert_eq!(fast_len, len);
+            assert_eq!(got[..len], want[..len], "delimiter mask {delimiters:016x}");
+        }
+    }
+
+    #[test]
+    fn batch_recovery_and_eof_preserve_field_addresses() {
+        fn check_batches<const N: usize>(row: &[u8], wrong: &[u8]) {
+            for prefix in [0, 1, 30, 62, 63, 64, 65, 1023, 1024] {
+                let mut data = b"header\n".to_vec();
+                data.extend(std::iter::repeat_n(b'x', prefix));
+                data.push(b'\n');
+                for i in 0..400 {
+                    data.extend_from_slice(row);
+                    if i == 110 {
+                        data.extend_from_slice(wrong);
+                        data.extend_from_slice(b"\n\"unclosed,quote\n");
+                    }
+                    if i == 220 {
+                        data.extend(std::iter::repeat_n(b'x', MAX_WORDS * 64 * 2));
+                        data.extend_from_slice(row);
+                    }
+                }
+                data.extend_from_slice(&row[..row.len() - 1]);
+                let collect = |fast, stats| {
+                    let mut rows = Vec::new();
+                    for_each_row::<N>(&data, true, fast, stats, |fields| {
+                        rows.push(std::array::from_fn::<_, N, _>(|i| {
+                            let field = fields.get(i);
+                            (field.as_ptr() as usize, field.len())
+                        }));
+                    });
+                    rows
+                };
+                let mut stats = ScanStats::default();
+                let got = collect(true, Some(&mut stats));
+                assert_eq!(got, collect(false, None), "prefix {prefix}");
+                assert!(stats.fast_batches > 0 && stats.fallback_batches > 0);
+                assert_eq!(stats.fast_records + stats.fallback_records, 407);
+            }
+        }
+        check_batches::<4>(b"\"A\",,\"\",t\r\n", b"too,many,,fields,here\nonly,three,fields\n");
+        check_batches::<7>(b"e,\"U\",,2027-10-01T12:00:00Z,\"view\",p,\"\"\n", b"a,b,c\na,b,c,d,e,f,g,h,i,j,k\n");
     }
 
     #[test]

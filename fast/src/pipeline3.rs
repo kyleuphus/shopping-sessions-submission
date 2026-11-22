@@ -42,7 +42,7 @@ use std::borrow::Cow;
 use std::error::Error;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use memmap2::Mmap;
@@ -55,6 +55,7 @@ use crate::key::{key_bytes, key_cmp, key_of, user_key_bytes, user_key_of, IdInte
 use crate::links2::{self, alias_hash, AliasMap, PersonMap};
 use crate::manifest;
 use crate::out::{self, CampaignDailyRow, UserDailyRow};
+use crate::scan3::{self, Fields, ScanStats};
 use crate::ts;
 
 const MS_PER_DAY: i64 = 86_400_000;
@@ -663,6 +664,8 @@ struct Ctx<'a> {
     parse_level: u8,
     /// `FAST_SCAN=0` selects the legacy event and click scanner.
     fast_scan: bool,
+    /// Event and click totals, merged once per chunk under FAST_TIMING.
+    scan_stats: Option<&'a [Mutex<ScanStats>; 2]>,
 }
 
 enum PersonLookup {
@@ -671,6 +674,22 @@ enum PersonLookup {
 }
 
 impl Ctx<'_> {
+    #[inline]
+    fn scan_records<'a, const N: usize>(
+        &self,
+        bytes: &'a [u8],
+        skip_header: bool,
+        f: impl FnMut(Fields<'a, '_, N>),
+    ) {
+        let mut stats = ScanStats::default();
+        scan3::for_each_row(
+            bytes, skip_header, self.fast_scan, self.scan_stats.map(|_| &mut stats), f,
+        );
+        if let Some(totals) = self.scan_stats {
+            totals[usize::from(N == 4)].lock().unwrap().merge(stats);
+        }
+    }
+
     #[inline]
     fn user_key<const RAW_USERS: bool>(&self, user: &[u8]) -> IdKey {
         if RAW_USERS {
@@ -683,18 +702,18 @@ impl Ctx<'_> {
     /// rules Events 3-4 for one copy: `Some((ts, pc))` if valid and not late.
     /// (Same checks as pipeline2's `validate_event`.)
     #[inline]
-    fn validate_event(&self, fields: &[&[u8]], ingest_ms: i64) -> Option<(i64, u32)> {
-        let user = fields[1];
-        let product = fields[5];
+    fn validate_event(&self, fields: Fields<'_, '_, 7>, ingest_ms: i64) -> Option<(i64, u32)> {
+        let user = fields.get(1);
+        let product = fields.get(5);
         if user.is_empty() || product.is_empty() {
             return None;
         }
-        let is_purchase = match fields[4] {
+        let is_purchase = match fields.get(4) {
             b"view" | b"cart" => false,
             b"purchase" => true,
             _ => return None,
         };
-        let event_ts = ts::parse_ts(fields[2])?;
+        let event_ts = ts::parse_ts(fields.get(2))?;
         if event_ts < self.window_start || event_ts >= self.window_end {
             return None;
         }
@@ -705,7 +724,7 @@ impl Ctx<'_> {
         if !is_purchase {
             return Some((event_ts, 0));
         }
-        let price = parse_digits(fields[6])?;
+        let price = parse_digits(fields.get(6))?;
         if !(1..=10_000_000).contains(&price) {
             return None;
         }
@@ -714,13 +733,13 @@ impl Ctx<'_> {
     }
 
     #[inline(always)]
-    fn validate_event_fast(&self, decode: &ts::DecodeCache, fields: &[&[u8]; 7], ingest_s: u32) -> Option<(i64, u32)> {
-        let product = fields[5];
-        if fields[1].is_empty() | product.is_empty() {
+    fn validate_event_fast(&self, decode: &ts::DecodeCache, fields: Fields<'_, '_, 7>, ingest_s: u32) -> Option<(i64, u32)> {
+        let product = fields.get(5);
+        if fields.get(1).is_empty() | product.is_empty() {
             return None;
         }
-        let is_purchase = purchase_type(fields[4])?;
-        let event_ts = decode.timestamp(fields[2])?;
+        let is_purchase = purchase_type(fields.get(4))?;
+        let event_ts = decode.timestamp(fields.get(2))?;
         let late_floor = i64::from(ingest_s) * 1000 - LATE_CUTOFF_MS;
         if (event_ts < self.window_start) | (event_ts >= self.window_end) | (event_ts < late_floor) {
             return None;
@@ -728,7 +747,7 @@ impl Ctx<'_> {
         if !is_purchase {
             return Some((event_ts, 0));
         }
-        let price = purchase_price(fields[6])?;
+        let price = purchase_price(fields.get(6))?;
         let cat = if let Some(index) = numbered_id(product, b"p") {
             self.dense_products[index]
         } else {
@@ -802,22 +821,21 @@ fn parse_event_chunk<const RAW_HEX: bool, const DECODE: bool, const RAW_USERS: b
     }
     let scan_bytes: &[u8] = if level < 1 { &[] } else { chunk.bytes };
     // One SIMD pass per chunk; malformed lines never reach the closure.
-    crate::scan3::for_each_record::<7>(scan_bytes, chunk.has_header, ctx.fast_scan, |fields| {
-        let fields: &[&[u8]; 7] = fields;
+    ctx.scan_records::<7>(scan_bytes, chunk.has_header, |fields| {
         // rules Events 1: empty event_id produces nothing.
-        if fields[0].is_empty() {
+        if fields.get(0).is_empty() {
             return;
         }
         if level < 2 {
-            std::hint::black_box(&fields);
+            fields.observe();
             return;
         }
         // rules: "ingest_ts is always valid F1", so use the F1-only parser.
         // Anything else drops the line (never happens on spec-conforming data).
         let ingest = if DECODE {
-            decode.unwrap().ingest_seconds(fields[3])
+            decode.unwrap().ingest_seconds(fields.get(3))
         } else {
-            ts::parse_ingest_ts(fields[3])
+            ts::parse_ingest_ts(fields.get(3))
         };
         let Some(ingest) = ingest else {
             return;
@@ -829,7 +847,7 @@ fn parse_event_chunk<const RAW_HEX: bool, const DECODE: bool, const RAW_USERS: b
             ctx.fallback.trip(format!("ingest_ts {ingest_ms} ms is not whole u32 seconds"));
             return;
         }
-        let event_id = fields[0];
+        let event_id = fields.get(0);
         let short = if DECODE { short_event_id(event_id) } else { None };
         let ekey = if let Some(key) = short {
             key
@@ -874,7 +892,7 @@ fn parse_event_chunk<const RAW_HEX: bool, const DECODE: bool, const RAW_USERS: b
         // `rec` here is the staging index; it is remapped after the scatter.
         let rec = match valid {
             Some((event_ts, pc)) => {
-                let user = ctx.user_key::<RAW_USERS>(fields[1]);
+                let user = ctx.user_key::<RAW_USERS>(fields.get(1));
                 if level < 5 {
                     std::hint::black_box(user);
                     return;
@@ -1033,13 +1051,12 @@ fn parse_click_chunk<const SOURCE_IDS: bool, const DECODE: bool, const RAW_USERS
         });
     }
     let scan_bytes: &[u8] = if level < 1 { &[] } else { chunk.bytes };
-    crate::scan3::for_each_record::<4>(scan_bytes, chunk.has_header, ctx.fast_scan, |fields| {
-        let fields: &[&[u8]; 4] = fields;
+    ctx.scan_records::<4>(scan_bytes, chunk.has_header, |fields| {
         if level < 3 {
-            std::hint::black_box(&fields);
+            fields.observe();
             return;
         }
-        let (click_id, user, campaign_id, ts_field) = (fields[0], fields[1], fields[2], fields[3]);
+        let (click_id, user, campaign_id, ts_field) = (fields.get(0), fields.get(1), fields.get(2), fields.get(3));
         // rules Clicks 1 and 3.
         let empty_id = if DECODE {
             click_id.is_empty() | user.is_empty()
@@ -3003,6 +3020,9 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     }
     let k = rec_index_bits(event_chunks.len());
 
+    let fast_scan = std::env::var_os("FAST_SCAN").as_deref() != Some(std::ffi::OsStr::new("0"));
+    let scan_stats = (stages.enabled && fast_scan && parse_level >= 1 && cfg!(target_endian = "little"))
+        .then(<[Mutex<ScanStats>; 2]>::default);
     let ctx = Ctx {
         window_start,
         window_end,
@@ -3021,7 +3041,8 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         k,
         fallback,
         parse_level,
-        fast_scan: std::env::var_os("FAST_SCAN").as_deref() != Some(std::ffi::OsStr::new("0")),
+        fast_scan,
+        scan_stats: scan_stats.as_ref(),
     };
     let source_click_ids = ctx.parse_level == 6
         && std::env::var_os("FAST_SOURCE_CLICK_IDS").as_deref() != Some(std::ffi::OsStr::new("0"))
@@ -3095,6 +3116,15 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     let ev_chunks: Vec<EvChunk> = ev_slots.into_iter().map(|c| c.expect("parsed")).collect();
     let ck_chunks: Vec<CkChunk> = ck_slots.into_iter().map(|c| c.expect("parsed")).collect();
     stages.mark("P parse (events+clicks)");
+    if let Some(totals) = &scan_stats {
+        for (kind, stats) in ["events", "clicks"].into_iter().zip(totals) {
+            let stats = stats.lock().unwrap();
+            eprintln!(
+                "  v3 scan {kind} fast_batches={} fallback_batches={} fast_records={} fallback_records={}",
+                stats.fast_batches, stats.fallback_batches, stats.fast_records, stats.fallback_records,
+            );
+        }
+    }
     if ctx.parse_level < 6 {
         eprintln!("v3: FAST_PARSE_LEVEL={} profiling run, stopping after P", ctx.parse_level);
         return Ok(());
@@ -3518,6 +3548,7 @@ empty,\"\",c1,2026-10-01T00:00:00Z",
                 fallback: &fallback,
                 parse_level: 6,
                 fast_scan: true,
+                scan_stats: None,
             };
             let evs: Vec<_> = event_input.iter().enumerate()
                 .map(|(i, chunk)| if ascii_users {
@@ -3713,6 +3744,7 @@ empty,\"\",c1,2026-10-01T00:00:00Z",
             fallback: &fallback,
             parse_level: 6,
             fast_scan: true,
+            scan_stats: None,
         };
         let mut input = b"header\n\
             e12345678,u,2028-02-29T00:00:00Z,2028-02-29T00:00:00Z,purchase,p1,\n\
@@ -3821,7 +3853,9 @@ empty,\"\",c1,2026-10-01T00:00:00Z",
         let mut bytes = b"id,user,ts,ingest,type,product,price\n".to_vec();
         bytes.push(b'"');
         bytes.extend_from_slice(&raw_a);
-        bytes.extend_from_slice(b"\",u,t,i,view,p,\n\"malformed,u,t,i,view,p,\n");
+        // Keep both colliding keys in a well-formed batch so this exercises
+        // the fast scanner's offsets as well as the legacy scanner's.
+        bytes.extend_from_slice(b"\",u,t,i,view,p,\n");
         bytes.extend_from_slice(&raw_b);
         bytes.extend_from_slice(b",u,t,i,view,p,");
         let input = [Chunk { bytes: &bytes, has_header: true }; 2];

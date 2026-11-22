@@ -78,7 +78,7 @@ COPY fast/.cargo/ ./.cargo/
 # copied to /out/pipeline.
 RUN touch src/main.rs src/lib.rs; \
     if [ "$(uname -m)" = "x86_64" ]; then \
-      CPU_FLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes"; \
+      CPU_FLAGS="-C target-cpu=x86-64-v3 -C target-feature=+aes,+pclmulqdq"; \
     else \
       CPU_FLAGS=""; \
     fi; \
