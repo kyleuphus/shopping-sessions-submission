@@ -3,8 +3,9 @@
 //! What it replaces: `for_each_line` (memchr per line) + `csvline::split_fields`
 //! (a per-line SIMD scan into a `Vec`). Here one pass over the chunk builds, per
 //! 64-byte block, three bitmasks — commas, quotes, newlines — and walks the
-//! comma/newline bits in order with `trailing_zeros`. A line's fields are
-//! located by its comma positions; nothing is allocated per line.
+//! comma/newline bits in order with `trailing_zeros`. The batched scanner
+//! checks quote syntax in the masks, then consumes the delimiter offsets in
+//! groups of four (clicks) or seven (events). Neither scanner allocates per line.
 //!
 //! The result is defined to be exactly what the old path produced (see the
 //! differential tests at the bottom, which compare against `split_fields` on
@@ -14,7 +15,7 @@
 //! - a line whose comma count is not `N - 1` is skipped (malformed);
 //! - quotes: same result as `csvline::unquote` on every field (strip one
 //!   wrapping pair; any other quote makes the line malformed), computed from
-//!   the line's quote count (see `finish`);
+//!   delimiter and quote masks;
 //! - a last line without a trailing `\n` is still a line.
 
 
@@ -108,9 +109,15 @@ fn block_masks_scalar(block: &[u8; 64]) -> Masks {
 /// Call `f` with the `N` fields of every well-formed line of `bytes`, in order.
 /// Malformed lines (see the module doc) are skipped silently. If `skip_header`
 /// the first line (up to and including its `\n`) is skipped; a header with no
-/// `\n` means there are no data lines.
+/// `\n` means there are no data lines. `fast` enables the batched scanner for
+/// the two pipeline schemas.
 #[inline]
-pub fn for_each_record<'a, const N: usize>(bytes: &'a [u8], skip_header: bool, mut f: impl FnMut(&[&'a [u8]; N])) {
+pub fn for_each_record<'a, const N: usize>(
+    bytes: &'a [u8],
+    skip_header: bool,
+    fast: bool,
+    mut f: impl FnMut(&[&'a [u8]; N]),
+) {
     assert!(N >= 1 && N <= 16);
     let buf = if skip_header {
         match memchr::memchr(b'\n', bytes) {
@@ -120,15 +127,23 @@ pub fn for_each_record<'a, const N: usize>(bytes: &'a [u8], skip_header: bool, m
     } else {
         bytes
     };
+    if fast && cfg!(target_endian = "little") && (N == 4 || N == 7) {
+        scan_batches(buf, &mut f);
+    } else {
+        scan_legacy(buf, &mut f);
+    }
+}
 
+#[inline]
+fn scan_legacy<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(&[&'a [u8]; N])) {
     // Per-line state.
     let mut line_start = 0usize;
     let mut commas = [0usize; 16]; // positions of the first N-1 commas
     let mut n_commas = 0usize;
-    let mut line_quotes = 0u32; // number of `"` bytes in the current line
+    let mut line_quotes = 0usize; // number of `"` bytes in the current line
 
     // Finish the line `[line_start, end)`; emits it if well-formed.
-    let mut finish = |line_start: usize, end: usize, commas: &[usize; 16], n_commas: usize, quotes: u32| {
+    let mut finish = |line_start: usize, end: usize, commas: &[usize; 16], n_commas: usize, quotes: usize| {
         if end == line_start || n_commas != N - 1 {
             return; // empty line, or wrong field count: malformed
         }
@@ -177,7 +192,7 @@ pub fn for_each_record<'a, const N: usize>(bytes: &'a [u8], skip_header: bool, m
         // with `unwrap_or(0)` never read out of bounds (an empty field yields
         // 0, not a quote) and lower to selects; `n >= 2` rules out a lone `"`
         // counting as both ends.
-        let mut stripped = 0u32;
+        let mut stripped = 0;
         let fields: [&'a [u8]; N] = std::array::from_fn(|k| {
             let (lo, hi) = bounds(k);
             // SAFETY: lo <= hi <= buf.len(), shown above.
@@ -185,7 +200,7 @@ pub fn for_each_record<'a, const N: usize>(bytes: &'a [u8], skip_header: bool, m
             let first = raw.first().copied().unwrap_or(0);
             let last = raw.last().copied().unwrap_or(0);
             let w = usize::from(raw.len() >= 2) & usize::from(first == b'"') & usize::from(last == b'"');
-            stripped += 2 * w as u32;
+            stripped += 2 * w;
             // SAFETY: w == 1 only if hi - lo >= 2, so lo + w <= hi - w <= buf.len().
             unsafe { buf.get_unchecked(lo + w..hi - w) }
         });
@@ -217,7 +232,7 @@ pub fn for_each_record<'a, const N: usize>(bytes: &'a [u8], skip_header: bool, m
                 // newline's clearing, at or after this line's start) belong to
                 // this line. Then drop every quote bit up to the newline.
                 let below = (1u64 << bit) - 1;
-                line_quotes += (quote & below).count_ones();
+                line_quotes += (quote & below).count_ones() as usize;
                 quote &= !(below | (1u64 << bit));
                 finish(line_start, pos, &commas, n_commas, line_quotes);
                 line_start = pos + 1;
@@ -232,11 +247,324 @@ pub fn for_each_record<'a, const N: usize>(bytes: &'a [u8], skip_header: bool, m
             }
         }
         // Remaining quote bits lie after the last newline: the current line's.
-        line_quotes += quote.count_ones();
+        line_quotes += quote.count_ones() as usize;
         base += 64;
     }
     if line_start < len {
         finish(line_start, len, &commas, n_commas, line_quotes);
+    }
+}
+
+// Keep uncommon batch recovery out of the scanner's and caller's hot loops.
+#[cold]
+#[inline(never)]
+fn recover_batch<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(&[&'a [u8]; N])) {
+    scan_legacy(buf, f);
+}
+
+// Offset entries contain the delimiter position plus one (relative to the
+// batch), a low bit for a closing quote, and a high bit for a newline.
+const NEWLINE: u16 = 1 << 15;
+const BATCH_WORDS: usize = 16;
+const MAX_WORDS: usize = 24;
+const OFFSETS_CAPACITY: usize = MAX_WORDS * 64 + 8;
+const _: () = assert!(MAX_WORDS * 64 + 1 < (NEWLINE as usize >> 1));
+
+#[inline(always)]
+fn read_masks(buf: &[u8], base: usize) -> Masks {
+    if let Some(block) = buf.get(base..base + 64) {
+        return block_masks(block.try_into().unwrap());
+    }
+    let remaining = &buf[base..];
+    let mut tail = [0; 64];
+    tail[..remaining.len()].copy_from_slice(remaining);
+    let mut masks = block_masks(&tail);
+    if buf.last() != Some(&b'\n') {
+        // Treat EOF as a newline at the end of an unterminated final line.
+        masks.newline |= 1 << remaining.len();
+    }
+    masks
+}
+
+#[inline(always)]
+fn is_delimiter(byte: u8) -> bool {
+    (byte == b',') | (byte == b'\n')
+}
+
+// A set bit in the result means an odd number of quotes at or below that bit.
+#[inline(always)]
+fn quote_parity(quotes: u64) -> u64 {
+    #[cfg(all(target_arch = "aarch64", target_feature = "aes"))]
+    {
+        // Carryless multiplication by all ones computes the prefix XOR.
+        // SAFETY: AES/PMULL is enabled at compile time.
+        return unsafe { std::arch::aarch64::vmull_p64(quotes, u64::MAX) as u64 };
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "aes")))]
+    {
+        let mut quotes = quotes ^ (quotes << 1);
+        quotes ^= quotes << 2;
+        quotes ^= quotes << 4;
+        quotes ^= quotes << 8;
+        quotes ^= quotes << 16;
+        quotes ^ (quotes << 32)
+    }
+}
+
+// Gather the mask byte for each delimiter, then shift the selected bit to
+// the top of its byte. The low eight lanes gather closing quotes and the
+// high eight gather newlines, so both sets of flags use one table lookup.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+fn tag_offsets_neon(positions: [u8; 8], base: u16, closing: u64, newline: u64) -> [u16; 8] {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is mandatory on aarch64.
+    unsafe {
+        let positions: uint8x8_t = std::mem::transmute(positions);
+        let bytes = vshr_n_u8::<3>(positions);
+        let indices = vcombine_u8(bytes, vadd_u8(bytes, vdup_n_u8(8)));
+        let masks = vcombine_u8(vcreate_u8(closing), vcreate_u8(newline));
+        let shifts = vsub_u8(vdup_n_u8(7), vand_u8(positions, vdup_n_u8(7)));
+        let shifts = vreinterpretq_s8_u8(vcombine_u8(shifts, shifts));
+        let bits = vshlq_u8(vqtbl1q_u8(masks, indices), shifts);
+        let closes = vshrq_n_u16::<7>(vmovl_u8(vget_low_u8(bits)));
+        let lines = vandq_u16(vshll_n_u8::<8>(vget_high_u8(bits)), vdupq_n_u16(NEWLINE));
+        let offsets = vaddq_u16(vshll_n_u8::<1>(positions), vdupq_n_u16(base.wrapping_mul(2)));
+        std::mem::transmute(vorrq_u16(offsets, vorrq_u16(closes, lines)))
+    }
+}
+
+/// Append the sorted delimiter offsets, carrying the closing-quote and newline
+/// flags with them. Every extra slot written by the unrolled path is ignored.
+#[inline(always)]
+fn append_offsets(
+    offsets: &mut [u16; OFFSETS_CAPACITY],
+    count: usize,
+    mut delimiters: u64,
+    relative_base: usize,
+    closing: u64,
+    newline: u64,
+) -> usize {
+    let n = delimiters.count_ones() as usize;
+    let mut next_bit = || {
+        let bit = delimiters.trailing_zeros();
+        delimiters &= delimiters.wrapping_sub(1);
+        bit
+    };
+    let tag = |bit: u32| {
+        let pos = relative_base.wrapping_add(bit as usize) as u16;
+        let quote = (closing.wrapping_shr(bit) & 1) as u16;
+        let newline = ((newline.wrapping_shr(bit) & 1) as u16) << 15;
+        (pos << 1) | quote | newline
+    };
+    // Almost all words have <= 8 delimiters. Unrolling avoids a loop exit
+    // branch with a different trip count for each word. A zero mask produces
+    // the throwaway bit index 64 for the unused slots.
+    #[cfg(target_arch = "aarch64")]
+    let entries = tag_offsets_neon(
+        std::array::from_fn(|_| next_bit() as u8), relative_base as u16, closing, newline,
+    );
+    #[cfg(not(target_arch = "aarch64"))]
+    let entries: [u16; 8] = std::array::from_fn(|_| tag(next_bit()));
+    // SAFETY: each input word contributes at most 64 entries; the scratch
+    // area has another eight slots for the throwaway stores.
+    debug_assert!(count + n.max(8) <= offsets.len());
+    unsafe {
+        let dst = offsets.as_mut_ptr().add(count);
+        dst.cast::<[u16; 8]>().write(entries);
+        for i in 8..n {
+            dst.add(i).write(tag(next_bit()));
+        }
+    }
+    count + n
+}
+
+#[inline]
+fn scan_batches<'a, const N: usize>(buf: &'a [u8], f: &mut impl FnMut(&[&'a [u8]; N])) {
+    if buf.is_empty() {
+        return;
+    }
+    // Every processed byte can contribute at most one offset, including EOF.
+    // Extra entries permit the rounded-up writes and reads of eight offsets.
+    let mut offsets = [0u16; OFFSETS_CAPACITY];
+    let mut start = 0;
+    let mut base = 0;
+    let mut masks = read_masks(buf, 0);
+    let (mut prev_delimiter, mut prev_quote) = (1, 0);
+    'batch: while start < buf.len() {
+        let mut count = 0;
+        let mut bad = 0;
+        let mut parity = 0;
+        let mut active = u64::MAX << (start - base);
+        let mut words = 1;
+        loop {
+            let seal = (words >= BATCH_WORDS || base + 64 >= buf.len())
+                && masks.newline & active != 0;
+            if words == MAX_WORDS && !seal {
+                // An unusually long line crosses our scratch-space limit. Go
+                // through the next newline so both scanners restart on a row.
+                let next = (base + 64).min(buf.len());
+                let end = memchr::memchr(b'\n', &buf[next..])
+                    .map_or(buf.len(), |nl| next + nl + 1);
+                recover_batch(&buf[start..end], f);
+                if end == buf.len() {
+                    return;
+                }
+                start = end;
+                base = end;
+                masks = read_masks(buf, base);
+                prev_delimiter = 1;
+                prev_quote = 0;
+                continue 'batch;
+            }
+
+            let mut end = 0;
+            if seal {
+                let last = 63 - (masks.newline & active).leading_zeros();
+                active &= u64::MAX >> (63 - last);
+                end = (base + last as usize + 1).min(buf.len());
+            }
+            let structural = masks.comma | masks.newline;
+            let quotes = masks.quote & active;
+            let delimiters = structural & active;
+            let next = buf.get(base + 64).copied().unwrap_or(b'\n');
+            let starts = (structural << 1) | prev_delimiter;
+            let ends = (structural >> 1) | (u64::from(is_delimiter(next)) << 63);
+            // Each quote must be at exactly one end of a field. The XOR
+            // also rejects a lone quote that is at both ends of its field.
+            bad |= quotes & !(starts ^ ends);
+            // No delimiter may be inside a quoted field. Together with the
+            // adjacency check this requires either zero or two quotes per field.
+            let inside = quote_parity(quotes) ^ parity;
+            bad |= inside & delimiters;
+            parity = 0u64.wrapping_sub(inside >> 63);
+            let closing = (masks.quote << 1) | prev_quote;
+
+            // On the cached first word, base can precede start. All actual
+            // offsets are positive because delimiters excludes that prefix.
+            let relative_base = (base + 1).wrapping_sub(start);
+            count = append_offsets(
+                &mut offsets, count, delimiters, relative_base, closing, masks.newline,
+            );
+
+            if seal {
+                if bad == 0 {
+                    emit_batch(&buf[start..end], &offsets, count, f);
+                } else {
+                    recover_batch(&buf[start..end], f);
+                }
+                if end == buf.len() {
+                    return;
+                }
+                start = end;
+                if start - base < 64 {
+                    // Keep the unconsumed suffix of this word, including
+                    // the delimiter immediately before it for quote adjacency.
+                    continue 'batch;
+                }
+            }
+            // Remember the byte to the left when advancing to the next word.
+            // The byte on the right is read above because its word is still
+            // unclassified. EOF acts as a delimiter on that side.
+            prev_delimiter = structural >> 63;
+            prev_quote = masks.quote >> 63;
+            base += 64;
+            masks = read_masks(buf, base);
+            if seal {
+                continue 'batch;
+            }
+            active = u64::MAX;
+            words += 1;
+        }
+    }
+}
+
+// To construct all field slices together, shift the original ends one lane
+// right to get the starts, then use each closing-quote flag to trim both ends.
+// The position-plus-one encoding makes the previous end the next raw start.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn normalize_offsets(input: *const u16, start: usize) -> ([u16; 8], [u16; 8]) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let raw = vld1q_u16(input);
+        let trim = vandq_u16(raw, vdupq_n_u16(1));
+        let ends = vshrq_n_u16::<1>(vandq_u16(raw, vdupq_n_u16(!NEWLINE)));
+        let starts = vaddq_u16(vextq_u16::<7>(vdupq_n_u16(start as u16), ends), trim);
+        let lengths = vsubq_u16(vsubq_u16(vsubq_u16(ends, starts), trim), vdupq_n_u16(1));
+        (std::mem::transmute(starts), std::mem::transmute(lengths))
+    }
+}
+
+#[cfg(all(target_arch = "x86_64", target_feature = "ssse3"))]
+#[inline(always)]
+unsafe fn normalize_offsets(input: *const u16, start: usize) -> ([u16; 8], [u16; 8]) {
+    use std::arch::x86_64::*;
+    unsafe {
+        let raw = _mm_loadu_si128(input.cast());
+        let trim = _mm_and_si128(raw, _mm_set1_epi16(1));
+        let ends = _mm_srli_epi16::<1>(_mm_and_si128(raw, _mm_set1_epi16(!NEWLINE as i16)));
+        let starts = _mm_add_epi16(_mm_alignr_epi8::<14>(ends, _mm_set1_epi16(start as i16)), trim);
+        let lengths = _mm_sub_epi16(_mm_sub_epi16(_mm_sub_epi16(ends, starts), trim), _mm_set1_epi16(1));
+        (std::mem::transmute(starts), std::mem::transmute(lengths))
+    }
+}
+
+#[inline(always)]
+fn emit_batch<'a, const N: usize>(
+    buf: &'a [u8],
+    offsets: &[u16; OFFSETS_CAPACITY],
+    count: usize,
+    f: &mut impl FnMut(&[&'a [u8]; N]),
+) {
+    debug_assert!(N == 4 || N == 7);
+    let mut start = 0;
+    let mut i = 0;
+    while i + N <= count {
+        // Each group must contain one newline, at its last delimiter. Check
+        // four or seven offsets at once so there is no per-field branch.
+        const MARKS: u64 = 0x8000_8000_8000_8000;
+        // SAFETY: each group has N entries, and the scratch array has a spare
+        // initialized entry for the second load in the seven-field case.
+        let ends = unsafe { offsets.as_ptr().add(i) };
+        let first = unsafe { ends.cast::<u64>().read_unaligned() };
+        let good = if N == 4 {
+            first & MARKS == 1 << 63
+        } else {
+            let last = unsafe { ends.add(4).cast::<u64>().read_unaligned() };
+            (first & MARKS) | ((last ^ (1 << 47)) & (MARKS >> 16)) == 0
+        };
+        if !good {
+            break;
+        }
+        // SAFETY: the checked group has N-1 commas and ends in a newline
+        // (or EOF). Batch validation proves that every trim bit represents
+        // a pair of quotes within its field. The array has room to load eight
+        // offsets and the unused SIMD lanes never become slices.
+        #[cfg(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "ssse3")))]
+        let fields = unsafe {
+            let (starts, lengths) = normalize_offsets(ends, start);
+            std::array::from_fn(|k| {
+                std::slice::from_raw_parts(buf.as_ptr().add(starts[k] as usize), lengths[k] as usize)
+            })
+        };
+        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "ssse3"))))]
+        let fields = std::array::from_fn(|k| {
+            // SAFETY: the same bounds and quote invariants hold here.
+            unsafe {
+                let prev = if k == 0 { start } else { (*ends.add(k - 1) >> 1) as usize };
+                let entry = *ends.add(k);
+                let end = ((entry & !NEWLINE) >> 1) as usize - 1;
+                let trim = (entry & 1) as usize;
+                std::slice::from_raw_parts(buf.as_ptr().add(prev + trim), end - prev - 2 * trim)
+            }
+        });
+        start = ((unsafe { *ends.add(N - 1) } & !NEWLINE) >> 1) as usize;
+        f(&fields);
+        i += N;
+    }
+    if i != count {
+        recover_batch(&buf[start..], f);
     }
 }
 
@@ -277,7 +605,7 @@ mod tests {
 
     fn scanned<const N: usize>(bytes: &[u8], skip_header: bool) -> Vec<Vec<Vec<u8>>> {
         let mut out = Vec::new();
-        for_each_record::<N>(bytes, skip_header, |fields| {
+        for_each_record::<N>(bytes, skip_header, true, |fields| {
             out.push(fields.iter().map(|f| f.to_vec()).collect());
         });
         out
@@ -491,23 +819,44 @@ mod tests {
     #[test]
     #[ignore]
     fn dataset_differential() {
-        let Ok(dir) = std::env::var("SCAN3_DATA") else { return };
+        fn compare<const N: usize>(bytes: &[u8], fast: bool, path: &std::path::Path) -> usize {
+            let mut lines = bytes.split(|&b| b == b'\n').skip(1);
+            let mut expected = Vec::with_capacity(N);
+            let mut count = 0;
+            for_each_record::<N>(bytes, true, fast, |fields| {
+                assert!(lines.any(|line| !line.is_empty() && split_fields(line, N, &mut expected)),
+                    "extra record in {path:?}, scanner={fast}");
+                for (got, want) in fields.iter().zip(&expected) {
+                    assert!(std::ptr::eq(*got, *want),
+                        "field span mismatch in {path:?}, record {count}, scanner={fast}");
+                }
+                count += 1;
+            });
+            assert!(!lines.any(|line| !line.is_empty() && split_fields(line, N, &mut expected)),
+                "missing record in {path:?}, scanner={fast}");
+            count
+        }
+
+        let dir = std::env::var("SCAN3_DATA").expect("set SCAN3_DATA to a dataset directory");
         let mut checked = 0usize;
         for (sub, n) in [("events", 7usize), ("clicks", 4)] {
             let mut files: Vec<_> = std::fs::read_dir(format!("{dir}/{sub}")).unwrap().map(|e| e.unwrap().path()).collect();
+            files.retain(|path| path.extension().is_some_and(|ext| ext == "csv"));
             files.sort();
             for path in files {
                 let bytes = std::fs::read(&path).unwrap();
-                let (a, b) = if n == 7 {
-                    (scanned::<7>(&bytes, true), reference::<7>(&bytes, true))
+                let compare = |fast| if n == 7 {
+                    compare::<7>(&bytes, fast, &path)
                 } else {
-                    (scanned::<4>(&bytes, true), reference::<4>(&bytes, true))
+                    compare::<4>(&bytes, fast, &path)
                 };
-                assert!(a == b, "mismatch in {path:?}");
-                checked += a.len();
+                let records = compare(true);
+                assert_eq!(records, compare(false), "record count mismatch in {path:?}");
+                checked += records;
             }
         }
-        eprintln!("scan3 dataset_differential: {checked} records identical");
+        assert!(checked > 0, "no accepted records in {dir}");
+        eprintln!("scan3 dataset_differential: {checked} records have identical offsets and lengths in both scanners and split_fields");
     }
 
     /// Frozen copy of `for_each_record` as of public 341a296 / private 865c931
@@ -593,16 +942,23 @@ mod tests {
     }
 
     /// (offset into `bytes`, length) of every emitted field, per record.
-    fn spans<const N: usize>(bytes: &[u8], skip: bool, v0: bool) -> Vec<[(usize, usize); N]> {
+    #[derive(Clone, Copy, Debug)]
+    enum Scanner {
+        V0,
+        Legacy,
+        Batched,
+    }
+
+    fn spans<const N: usize>(bytes: &[u8], skip: bool, scanner: Scanner) -> Vec<[(usize, usize); N]> {
         let base = bytes.as_ptr() as usize;
         let mut out = Vec::new();
         let mut push = |fields: &[&[u8]; N]| {
             out.push(std::array::from_fn(|k| (fields[k].as_ptr() as usize - base, fields[k].len())));
         };
-        if v0 {
-            for_each_record_v0::<N>(bytes, skip, &mut push);
-        } else {
-            for_each_record::<N>(bytes, skip, &mut push);
+        match scanner {
+            Scanner::V0 => for_each_record_v0::<N>(bytes, skip, &mut push),
+            Scanner::Legacy => for_each_record::<N>(bytes, skip, false, &mut push),
+            Scanner::Batched => for_each_record::<N>(bytes, skip, true, &mut push),
         }
         out
     }
@@ -612,9 +968,12 @@ mod tests {
         for skip in [false, true] {
             macro_rules! one {
                 ($n:literal) => {{
-                    let (new, old) = (spans::<$n>(bytes, skip, false), spans::<$n>(bytes, skip, true));
-                    assert_eq!(new, old, "N={} skip={skip} input={:?}", $n, String::from_utf8_lossy(bytes));
-                    accepted += new.len();
+                    let old = spans::<$n>(bytes, skip, Scanner::V0);
+                    for scanner in [Scanner::Legacy, Scanner::Batched] {
+                        let got = spans::<$n>(bytes, skip, scanner);
+                        assert_eq!(got, old, "N={} skip={skip} {scanner:?} input={:?}", $n, String::from_utf8_lossy(bytes));
+                    }
+                    accepted += old.len();
                 }};
             }
             one!(1);
@@ -626,8 +985,8 @@ mod tests {
         accepted
     }
 
-    /// The fused field construction emits the same subslices (same offsets
-    /// into the input, not just equal bytes) as the 341a296 code, on the hand
+    /// Both scanners emit the same subslices (offsets and lengths) as the
+    /// 341a296 code, on the hand
     /// cases plus random adversarial buffers: wrapping, interior and lone
     /// quotes, empty fields, spaces and `\r`, wrong comma counts, lines placed
     /// across 64-byte block edges, and last lines with and without `\n`.
@@ -640,6 +999,20 @@ mod tests {
             b"\"x\",\"\",\"\"\"\",\" \",\"\r\",\"a,b\"\n", b",,,\n,,,,,,\n\"\",,\"\",\n",
         ] {
             accepted += check_spans(case);
+        }
+        for pad in 0..64 {
+            let mut body = vec![b'h'; pad];
+            body.push(b'\n');
+            // Many short rows can exceed the compact delimiter buffer.
+            body.extend_from_slice(&b"\"\",,x,\n".repeat(100));
+            body.extend_from_slice(&b"a,b,c,d,e,f,\n".repeat(100));
+            // A long field spans the batch word limit, followed by rows
+            // with internal quotes and too few/many commas, then valid rows.
+            body.extend_from_slice(b"\"");
+            body.extend_from_slice(&[b'x'; 64 * MAX_WORDS + 1]);
+            body.extend_from_slice(b"\",b,c,d\na,b,c,d,e,f,g\na\",b,c,d\na,b,c\na,b,c,d,e\n");
+            body.extend_from_slice(b"a,b,c,\"\"\na,b,c,d,e,f,\r\na,b,c,d,e,f,\"\"");
+            accepted += check_spans(&body);
         }
         let mut rng = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move || {

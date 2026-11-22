@@ -51,8 +51,8 @@ use rayon::prelude::*;
 use crate::csvline::{data_lines, split_fields};
 use crate::hash::{fmix64, FastMap};
 use crate::intern::Interner;
-use crate::key::{key_bytes, key_cmp, key_of, IdInterner, IdKey};
-use crate::links2::{self, PersonMap};
+use crate::key::{key_bytes, key_cmp, key_of, user_key_bytes, user_key_of, IdInterner, IdKey};
+use crate::links2::{self, alias_hash, AliasMap, PersonMap};
 use crate::manifest;
 use crate::out::{self, CampaignDailyRow, UserDailyRow};
 use crate::ts;
@@ -470,7 +470,11 @@ impl Parts {
     }
     #[inline(always)]
     fn person(self, key: IdKey) -> usize {
-        (fmix64(key ^ 0x7065_7273_6f6e_7633) >> (64 - self.bits)) as usize
+        self.person_hashed(fmix64(key ^ 0x7065_7273_6f6e_7633))
+    }
+    #[inline(always)]
+    fn person_hashed(self, hash: u64) -> usize {
+        (hash >> (64 - self.bits)) as usize
     }
 }
 
@@ -536,8 +540,9 @@ struct Ctx<'a> {
     dense_campaigns: Vec<u16>,
     real_campaign_count: u32,
     decode: Option<ts::DecodeCache>,
-    people: &'a PersonMap,
+    people: &'a PersonLookup,
     ids: &'a IdInterner,
+    user_ids: &'a IdInterner,
     parts: Parts,
     /// See [`rec_index_bits`].
     k: u32,
@@ -549,9 +554,25 @@ struct Ctx<'a> {
     /// cost = difference between consecutive levels. Clicks: 1-2 split,
     /// 3 validate, 4 user + click keys, 5 push + resolve, 6 scatter.
     parse_level: u8,
+    /// `FAST_SCAN=0` selects the legacy event and click scanner.
+    fast_scan: bool,
+}
+
+enum PersonLookup {
+    Legacy(PersonMap),
+    Aliases(AliasMap),
 }
 
 impl Ctx<'_> {
+    #[inline]
+    fn user_key<const RAW_USERS: bool>(&self, user: &[u8]) -> IdKey {
+        if RAW_USERS {
+            user_key_of(user, self.user_ids)
+        } else {
+            key_of(user, self.user_ids)
+        }
+    }
+
     /// rules Events 3-4 for one copy: `Some((ts, pc))` if valid and not late.
     /// (Same checks as pipeline2's `validate_event`.)
     #[inline]
@@ -648,7 +669,7 @@ fn general_event_key(id: &[u8], ids: &IdInterner) -> IdKey {
     key_of(id, ids)
 }
 
-fn parse_event_chunk<const RAW_HEX: bool, const DECODE: bool>(
+fn parse_event_chunk<const RAW_HEX: bool, const DECODE: bool, const RAW_USERS: bool>(
     ctx: &Ctx<'_>,
     chunk: &Chunk<'_>,
     chunk_id: usize,
@@ -674,7 +695,7 @@ fn parse_event_chunk<const RAW_HEX: bool, const DECODE: bool>(
     }
     let scan_bytes: &[u8] = if level < 1 { &[] } else { chunk.bytes };
     // One SIMD pass per chunk; malformed lines never reach the closure.
-    crate::scan3::for_each_record::<7>(scan_bytes, chunk.has_header, |fields| {
+    crate::scan3::for_each_record::<7>(scan_bytes, chunk.has_header, ctx.fast_scan, |fields| {
         let fields: &[&[u8]; 7] = fields;
         // rules Events 1: empty event_id produces nothing.
         if fields[0].is_empty() {
@@ -746,7 +767,7 @@ fn parse_event_chunk<const RAW_HEX: bool, const DECODE: bool>(
         // `rec` here is the staging index; it is remapped after the scatter.
         let rec = match valid {
             Some((event_ts, pc)) => {
-                let user = key_of(fields[1], ctx.ids);
+                let user = ctx.user_key::<RAW_USERS>(fields[1]);
                 if level < 5 {
                     std::hint::black_box(user);
                     return;
@@ -811,34 +832,79 @@ fn parse_event_chunk<const RAW_HEX: bool, const DECODE: bool>(
     }
 }
 
-/// Replace each record's raw user key with its person key
-/// (`PersonMap::get(user).unwrap_or(user)`, rules Linked IDs) and return each
-/// record's person-partition tag.
-///
-/// Why a separate pass: the PersonMap is tens of MB, so nearly every lookup is
-/// a cache miss. Inside the branchy per-line parse loop the CPU can wait on
-/// only about one miss at a time; in this tight loop the lookups do not depend
-/// on each other, so the out-of-order core overlaps many of them.
-fn resolve_persons<T>(ctx: &Ctx<'_>, records: &mut [T], person: impl Fn(&mut T) -> &mut IdKey) -> Vec<u16> {
-    let parts = ctx.parts;
+/// Replace raw user keys with person names, and return their partition tags.
+fn resolve_persons<T>(
+    ctx: &Ctx<'_>,
+    records: &mut [T],
+    person: impl Fn(&mut T) -> &mut IdKey,
+) -> Vec<u16> {
+    match ctx.people {
+        PersonLookup::Legacy(people) => resolve_persons_old(ctx.parts, people, records, person),
+        PersonLookup::Aliases(people) => resolve_aliases(ctx.parts, people, records, person),
+    }
+}
+
+fn resolve_persons_old<T>(
+    parts: Parts,
+    people: &PersonMap,
+    records: &mut [T],
+    person: impl Fn(&mut T) -> &mut IdKey,
+) -> Vec<u16> {
     let mut tags = Vec::with_capacity(records.len());
-    // Prefetch the PersonMap slot of the record PREFETCH_AHEAD positions
-    // ahead, so its DRAM fetch is in flight by the time we look it up.
     const PREFETCH_AHEAD: usize = 16;
     let n = records.len();
     for i in 0..n {
         if i + PREFETCH_AHEAD < n {
-            let ahead = *person(&mut records[i + PREFETCH_AHEAD]);
-            ctx.people.prefetch(ahead);
+            people.prefetch(*person(&mut records[i + PREFETCH_AHEAD]));
         }
         let key = person(&mut records[i]);
-        *key = ctx.people.get(*key).unwrap_or(*key);
+        *key = people.get(*key).unwrap_or(*key);
         tags.push(parts.person(*key) as u16);
     }
     tags
 }
 
-fn parse_click_chunk<const SOURCE_IDS: bool, const DECODE: bool>(
+/// Route each record as itself first. Only possible aliases enter the
+/// prefetch queue. The lookup's low hash bits address the bucket, while the
+/// high bits already give the partition for a key that names itself.
+fn resolve_aliases<T>(
+    parts: Parts,
+    people: &AliasMap,
+    records: &mut [T],
+    person: impl Fn(&mut T) -> &mut IdKey,
+) -> Vec<u16> {
+    // At this size the queue still fits in L1, and the bucket reads get
+    // enough lead time even after the filter rejects most records.
+    const BATCH: usize = 256;
+    let mut tags = Vec::with_capacity(records.len());
+    let mut pending = [(0, 0); BATCH];
+    for batch in records.chunks_mut(BATCH) {
+        let start = tags.len();
+        let mut count = 0;
+        for (i, record) in batch.iter_mut().enumerate() {
+            let hash = alias_hash(*person(record));
+            tags.push(parts.person_hashed(hash) as u16);
+            // Advance the queue only for possible aliases, without a branch.
+            pending[count] = (i, hash);
+            count += usize::from(people.may_contain(hash));
+        }
+        let pending = &pending[..count];
+        for &(_, hash) in pending {
+            people.prefetch(hash);
+        }
+        for &(i, hash) in pending {
+            let key = person(&mut batch[i]);
+            let name = people.resolve(*key, hash);
+            if name != *key {
+                *key = name;
+                tags[start + i] = parts.person_hashed(alias_hash(name)) as u16;
+            }
+        }
+    }
+    tags
+}
+
+fn parse_click_chunk<const SOURCE_IDS: bool, const DECODE: bool, const RAW_USERS: bool>(
     ctx: &Ctx<'_>,
     chunk: &Chunk<'_>,
     chunk_id: usize,
@@ -860,7 +926,7 @@ fn parse_click_chunk<const SOURCE_IDS: bool, const DECODE: bool>(
         });
     }
     let scan_bytes: &[u8] = if level < 1 { &[] } else { chunk.bytes };
-    crate::scan3::for_each_record::<4>(scan_bytes, chunk.has_header, |fields| {
+    crate::scan3::for_each_record::<4>(scan_bytes, chunk.has_header, ctx.fast_scan, |fields| {
         let fields: &[&[u8]; 4] = fields;
         if level < 3 {
             std::hint::black_box(&fields);
@@ -907,7 +973,7 @@ fn parse_click_chunk<const SOURCE_IDS: bool, const DECODE: bool>(
             std::hint::black_box((click_ts, campaign));
             return;
         }
-        let user = key_of(user, ctx.ids);
+        let user = ctx.user_key::<RAW_USERS>(user);
         let click = if SOURCE_IDS {
             // The scanner returns a nonempty subslice of this chunk. The driver
             // checks the chunk count and byte lengths before enabling source IDs.
@@ -1722,6 +1788,7 @@ fn group_partition(scratch: &mut Scratch, click_ids: ClickIds<'_>, radix: bool) 
 struct PersonCtx<'a> {
     base: i64,
     ids: &'a IdInterner,
+    ascii_users: bool,
     cat_names: &'a [&'a [u8]],
     organic: u32,
     click_ids: ClickIds<'a>,
@@ -1786,7 +1853,12 @@ fn process_partition<'a>(
         let events = &evs_by[ev_off[d] as usize..ev_off[d + 1] as usize];
         let person_clicks = &cks_by[ck_off[d] as usize..ck_off[d + 1] as usize];
 
-        let person_name = String::from_utf8_lossy(key_bytes(person, ids, name_bytes)).into_owned();
+        let name = if pc.ascii_users {
+            user_key_bytes(person, ids, name_bytes)
+        } else {
+            key_bytes(person, ids, name_bytes)
+        };
+        let person_name = String::from_utf8_lossy(name).into_owned();
 
         // --- Sessionize (rules Events 5-6), as pipeline2 ---
         sessions.clear();
@@ -2042,7 +2114,14 @@ fn process_partition2(
         let person_clicks = &cks_by[ck_off[d] as usize..ck_off[d + 1] as usize];
         // Borrowed (no allocation) whenever the name is valid UTF-8, which
         // the old path's from_utf8_lossy would also have kept unchanged.
-        let person_name = String::from_utf8_lossy(key_bytes(person, ids, name_bytes));
+        // Person keys come from the user-ID table when FAST_PERSON is on
+        // (atk-person), so decode them with the matching function.
+        let name = if pc.ascii_users {
+            user_key_bytes(person, ids, name_bytes)
+        } else {
+            key_bytes(person, ids, name_bytes)
+        };
+        let person_name = String::from_utf8_lossy(name);
 
         // --- Sessionize (rules Events 5-6) ---
         sessions.clear();
@@ -2275,6 +2354,8 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         Some("1") => true, // Also profile the full pipeline's event keys at levels 2–5.
         _ => parse_level == 6,
     };
+    // FAST_PERSON=0 restores the original shared ID interner and person map.
+    let fast_person = std::env::var_os("FAST_PERSON").as_deref() != Some(std::ffi::OsStr::new("0"));
 
     // --- L: links ---
     let compact_hex = raw_hex && std::env::var_os("FAST_COMPACT_HEX_TABLE").as_deref()
@@ -2287,7 +2368,26 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         IdInterner::new()
     };
     let link_files: Vec<&[u8]> = link_maps.iter().map(|map| &map[..]).collect();
-    let people = links2::build(&link_files, &ids);
+    let compact_user_ids = if fast_person {
+        // Isolate users from event/click IDs so the user hex working set can
+        // be sized for repeated IDs. Full regions still intern exactly.
+        let bytes: usize = event_maps
+            .iter()
+            .chain(&click_maps)
+            .chain(&link_maps)
+            .map(|map| map.len())
+            .sum();
+        let slots = (bytes / 4096).clamp(64, 1 << 28).next_power_of_two();
+        Some(IdInterner::with_hex_log2(slots.ilog2()))
+    } else {
+        None
+    };
+    let user_ids = compact_user_ids.as_ref().unwrap_or(&ids);
+    let people = if fast_person {
+        PersonLookup::Aliases(links2::build_aliases(&link_files, user_ids))
+    } else {
+        PersonLookup::Legacy(links2::build(&link_files, user_ids))
+    };
     stages.mark("L links");
 
     // --- P: one parallel pass over all event and click chunks ---
@@ -2312,10 +2412,12 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         decode,
         people: &people,
         ids: &ids,
+        user_ids,
         parts,
         k,
         fallback,
         parse_level,
+        fast_scan: std::env::var_os("FAST_SCAN").as_deref() != Some(std::ffi::OsStr::new("0")),
     };
     let source_click_ids = ctx.parse_level == 6
         && std::env::var_os("FAST_SOURCE_CLICK_IDS").as_deref() != Some(std::ffi::OsStr::new("0"))
@@ -2339,19 +2441,27 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
         .with_max_len(1)
         .map(|&(is_event, i, _)| {
             if is_event {
-                let chunk = match (raw_hex, ctx.decode.is_some()) {
-                    (true, true) => parse_event_chunk::<true, true>(&ctx, &event_chunks[i], i),
-                    (true, false) => parse_event_chunk::<true, false>(&ctx, &event_chunks[i], i),
-                    (false, true) => parse_event_chunk::<false, true>(&ctx, &event_chunks[i], i),
-                    (false, false) => parse_event_chunk::<false, false>(&ctx, &event_chunks[i], i),
+                let chunk = match (raw_hex, ctx.decode.is_some(), fast_person) {
+                    (true, true, true) => parse_event_chunk::<true, true, true>(&ctx, &event_chunks[i], i),
+                    (true, true, false) => parse_event_chunk::<true, true, false>(&ctx, &event_chunks[i], i),
+                    (true, false, true) => parse_event_chunk::<true, false, true>(&ctx, &event_chunks[i], i),
+                    (true, false, false) => parse_event_chunk::<true, false, false>(&ctx, &event_chunks[i], i),
+                    (false, true, true) => parse_event_chunk::<false, true, true>(&ctx, &event_chunks[i], i),
+                    (false, true, false) => parse_event_chunk::<false, true, false>(&ctx, &event_chunks[i], i),
+                    (false, false, true) => parse_event_chunk::<false, false, true>(&ctx, &event_chunks[i], i),
+                    (false, false, false) => parse_event_chunk::<false, false, false>(&ctx, &event_chunks[i], i),
                 };
                 Parsed::E(i, chunk)
             } else {
-                let chunk = match (source_click_ids, ctx.decode.is_some()) {
-                    (true, true) => parse_click_chunk::<true, true>(&ctx, &click_chunks[i], i),
-                    (true, false) => parse_click_chunk::<true, false>(&ctx, &click_chunks[i], i),
-                    (false, true) => parse_click_chunk::<false, true>(&ctx, &click_chunks[i], i),
-                    (false, false) => parse_click_chunk::<false, false>(&ctx, &click_chunks[i], i),
+                let chunk = match (source_click_ids, ctx.decode.is_some(), fast_person) {
+                    (true, true, true) => parse_click_chunk::<true, true, true>(&ctx, &click_chunks[i], i),
+                    (true, true, false) => parse_click_chunk::<true, true, false>(&ctx, &click_chunks[i], i),
+                    (true, false, true) => parse_click_chunk::<true, false, true>(&ctx, &click_chunks[i], i),
+                    (true, false, false) => parse_click_chunk::<true, false, false>(&ctx, &click_chunks[i], i),
+                    (false, true, true) => parse_click_chunk::<false, true, true>(&ctx, &click_chunks[i], i),
+                    (false, true, false) => parse_click_chunk::<false, true, false>(&ctx, &click_chunks[i], i),
+                    (false, false, true) => parse_click_chunk::<false, false, true>(&ctx, &click_chunks[i], i),
+                    (false, false, false) => parse_click_chunk::<false, false, false>(&ctx, &click_chunks[i], i),
                 };
                 Parsed::C(i, chunk)
             }
@@ -2405,7 +2515,8 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     order.sort_unstable_by_key(|&(_, size)| std::cmp::Reverse(size));
     let person_ctx = PersonCtx {
         base,
-        ids: &ids,
+        ids: user_ids,
+        ascii_users: fast_person,
         cat_names: &cat_names,
         organic,
         click_ids: if source_click_ids {
@@ -2616,6 +2727,7 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
     std::mem::forget(ck_chunks);
     std::mem::forget(ctx);
     std::mem::forget(people);
+    std::mem::forget(compact_user_ids);
     std::mem::forget(ids);
     std::mem::forget(event_maps);
     std::mem::forget(click_maps);
@@ -2626,6 +2738,142 @@ fn run_v3(data: &Path, output: &Path, fallback: &Fallback) -> Result<(), Box<dyn
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn person_paths_agree_through_scatter_dedup_and_click_ties() {
+        let links = b"a,b\n\
+\" aa root \",\"u12345678\"\n\
+u12345678,u00000000000000000000000000000000\n\
+u12345678,zzzzzzzzzz\n\
+u12345678,\"p123\r5678\"\n\
+u12345678,u12345678\n\
+u12345678,\"\"\n\
+u12345678,bad\"quote\n\
+u12345678,wouldlink,extra\n";
+        let mut events = b"event,user,ts,ingest,type,product,price\n\
+e1,\"u12345678\",2026-10-01T00:00:00Z,2026-10-01T00:00:00Z,view,p,\n\
+dup,\"\",2026-10-01T00:00:00Z,2026-10-01T00:00:00Z,view,p,\n\
+e2,u00000000000000000000000000000000,2026-10-01T00:00:00Z,2026-10-01T00:00:00Z,purchase,p,\"0250\"\n"
+            .to_vec();
+        // A malformed line straddles the byte target. The following chunk
+        // starts with a real row, and the invalid dedup winner is in chunk 0.
+        events.resize(CHUNK_BYTES + 11, b'x');
+        events.extend_from_slice(b"\n\
+dup,q00000000,2026-10-01T00:00:00Z,2026-10-01T00:00:01Z,view,p,\n\
+e3,zzzzzzzzzz,2026-10-01T00:00:00Z,2026-10-01T00:00:00Z,view,p,\n\
+e4,\"p123\r5678\",2026-10-01T00:00:00Z,2026-10-01T00:00:00Z,cart,p,\n\
+e5,q00000000,2026-10-01T00:00:00Z,2026-10-01T00:00:00Z,view,p,\r\n\
+bad-price,u12345678,2026-10-01T00:00:00Z,2026-10-01T00:00:00Z,purchase,p,10\r\n\
+bad\"quote,q00000000,2026-10-01T00:00:00Z,2026-10-01T00:00:00Z,view,p,\n\
+extra,q00000000,2026-10-01T00:00:00Z,2026-10-01T00:00:00Z,view,p,,extra");
+        let event_input = chunk_files(&[&events]);
+        assert_eq!(event_input.len(), 2);
+        let click_input = [
+            Chunk {
+                bytes: b"click,user,campaign,ts\n\
+z00000000000000000000000000000000,u12345678,c2,2026-10-01T00:00:00Z\n\
+bad,q00000000,c1,2026-10-01T00:00:00Z\r\n",
+                has_header: true,
+            },
+            Chunk {
+                bytes: b"\"A generic click\",u00000000000000000000000000000000,c1,2026-10-01T00:00:00Z\n\
+empty,\"\",c1,2026-10-01T00:00:00Z",
+                has_header: false,
+            },
+        ];
+
+        let run = |ascii_users| {
+            let ids = IdInterner::with_hex_log2(6);
+            let compact_users = IdInterner::with_hex_log2(6);
+            let user_ids = if ascii_users { &compact_users } else { &ids };
+            let people = if ascii_users {
+                PersonLookup::Aliases(links2::build_aliases(&[links], user_ids))
+            } else {
+                PersonLookup::Legacy(links2::build(&[links], user_ids))
+            };
+            let window_start = ts::parse_ts(b"2026-10-01T00:00:00Z").unwrap();
+            let window_end = window_start + MS_PER_DAY;
+            let mut product_cat = FastMap::default();
+            product_cat.insert(b"p".as_slice(), 0);
+            let mut campaigns = Interner::new();
+            campaigns.intern(b"c1");
+            campaigns.intern(b"c2");
+            let organic = campaigns.intern(b"organic");
+            let fallback = Fallback::default();
+            let ctx = Ctx {
+                window_start,
+                window_end,
+                base: window_start - SEVEN_DAYS_MS,
+                product_cat,
+                // No canonical p<n> / c_<n> IDs here: dense tables say "absent".
+                dense_products: vec![1; NUMBERED_IDS],
+                unknown_cat: 1,
+                campaigns,
+                dense_campaigns: vec![u16::MAX; NUMBERED_IDS],
+                real_campaign_count: 2,
+                // This test isolates the person paths; it keeps the old decoder.
+                decode: None,
+                people: &people,
+                ids: &ids,
+                user_ids,
+                parts: Parts { bits: MIN_PARTITION_BITS },
+                k: rec_index_bits(event_input.len()),
+                fallback: &fallback,
+                parse_level: 6,
+                fast_scan: true,
+            };
+            let evs: Vec<_> = event_input.iter().enumerate()
+                .map(|(i, chunk)| if ascii_users {
+                    parse_event_chunk::<true, false, true>(&ctx, chunk, i)
+                } else {
+                    parse_event_chunk::<true, false, false>(&ctx, chunk, i)
+                })
+                .collect();
+            let cks: Vec<_> = click_input.iter().enumerate()
+                .map(|(i, chunk)| if ascii_users {
+                    parse_click_chunk::<true, false, true>(&ctx, chunk, i)
+                } else {
+                    parse_click_chunk::<true, false, false>(&ctx, chunk, i)
+                })
+                .collect();
+            assert!(!fallback.is_set());
+            let pc = PersonCtx {
+                base: ctx.base,
+                ids: user_ids,
+                ascii_users,
+                cat_names: &[b"cat", b"unknown"],
+                organic,
+                click_ids: ClickIds::Source(&click_input),
+            };
+            let mut rows = Vec::new();
+            let mut days = CampaignDays::new(3, window_start, window_end);
+            let mut scratch = Scratch::new(2);
+            for part in 0..ctx.parts.count() {
+                dedup_raw_sorted(&evs, &event_input, part, ctx.k);
+            }
+            for part in 0..ctx.parts.count() {
+                process_partition(part, &evs, &cks, &pc, &mut scratch, &mut days, &mut rows);
+            }
+            let mut users: Vec<_> = rows.into_iter().map(|r| (
+                r.user_id.into_owned(), r.sessions, r.events, r.revenue_cents,
+                r.top_category.map(Cow::into_owned),
+            )).collect();
+            users.sort_unstable();
+            let mut credits = Vec::new();
+            days.for_each_row(|id, _, day| {
+                credits.push((id, day.sessions, day.revenue, day.assisted_sessions));
+            });
+            credits.sort_unstable();
+            (users, credits)
+        };
+        let old = run(false);
+        assert_eq!(run(true), old);
+        assert_eq!(old.0, vec![
+            (" aa root ".into(), 1, 4, 250, Some("cat".into())),
+            ("q00000000".into(), 1, 1, 0, None),
+        ]);
+        assert_eq!(old.1, vec![(0, 1, 250, 1), (1, 0, 0, 1), (2, 1, 0, 0)]);
+    }
 
     /// An EvChunk with `n` Evs and nothing else, for dead-bit tests.
     fn chunk_with(n: usize) -> EvChunk {
@@ -2733,7 +2981,7 @@ mod tests {
         let begin = ts::parse_ts(b"2028-02-29T00:00:00Z").unwrap();
         let end = ts::parse_ts(b"2028-03-01T00:00:00Z").unwrap();
         let ids = IdInterner::with_hex_log2(6);
-        let people = links2::build(&[], &ids);
+        let people = PersonLookup::Legacy(links2::build(&[], &ids));
         let fallback = Fallback::default();
         let mut campaigns = Interner::new();
         let one = campaigns.intern(b"c_1");
@@ -2754,12 +3002,14 @@ mod tests {
             dense_campaigns,
             real_campaign_count: 2,
             decode: Some(ts::DecodeCache::new(begin, end)),
-            people: &people,
+            people: &people,  // wrapped as PersonLookup below
+            user_ids: &ids,
             ids: &ids,
             parts: Parts { bits: 4 },
             k: K,
             fallback: &fallback,
             parse_level: 6,
+            fast_scan: true,
         };
         let mut input = b"header\n\
             e12345678,u,2028-02-29T00:00:00Z,2028-02-29T00:00:00Z,purchase,p1,\n\
@@ -2791,9 +3041,9 @@ mod tests {
                 .enumerate()
                 .map(|(i, chunk)| {
                     if fast {
-                        parse_event_chunk::<true, true>(&ctx, chunk, i)
+                        parse_event_chunk::<true, true, false>(&ctx, chunk, i)
                     } else {
-                        parse_event_chunk::<true, false>(&ctx, chunk, i)
+                        parse_event_chunk::<true, false, false>(&ctx, chunk, i)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -2851,8 +3101,8 @@ mod tests {
                 hole,u,c_2,2028-02-22T00:00:00Z\n\
                 organic,u,organic,2028-02-22T00:00:00Z",
         }];
-        let mut new = parse_click_chunk::<true, true>(&ctx, &clicks[0], 0).cks;
-        let old = parse_click_chunk::<true, false>(&ctx, &clicks[0], 0).cks;
+        let mut new = parse_click_chunk::<true, true, false>(&ctx, &clicks[0], 0).cks;
+        let old = parse_click_chunk::<true, false, false>(&ctx, &clicks[0], 0).cks;
         assert_eq!(new, old);
         sort_clicks_with_source_ids(&mut new, &clicks);
         // The source sort places the winner first within each timestamp tie.
@@ -2865,11 +3115,28 @@ mod tests {
     fn raw_event_fingerprint_collisions_preserve_exact_winners_in_both_kernels() {
         let raw_a = crate::hexid::render(b'e', 7);
         let raw_b = *b"E00000000000000000000000000000007";
-        let mut bytes = raw_a.to_vec();
+        let mut bytes = b"id,user,ts,ingest,type,product,price\n".to_vec();
+        bytes.push(b'"');
+        bytes.extend_from_slice(&raw_a);
+        bytes.extend_from_slice(b"\",u,t,i,view,p,\n\"malformed,u,t,i,view,p,\n");
         bytes.extend_from_slice(&raw_b);
-        let input = [Chunk { bytes: &bytes, has_header: false }; 2];
-        let key_a = (11 << (RAW_EVENT_OFFSET_BITS + 4)) | RAW_EVENT_TAG;
-        let key_b = key_a | ((raw_a.len() as u64) << 4);
+        bytes.extend_from_slice(b",u,t,i,view,p,");
+        let input = [Chunk { bytes: &bytes, has_header: true }; 2];
+        let scanned_keys = |fast| {
+            let mut keys = Vec::new();
+            crate::scan3::for_each_record::<7>(&bytes, true, fast, |fields| {
+                let offset = fields[0].as_ptr() as usize - bytes.as_ptr() as usize;
+                // Force a collision in the routing fingerprint. Dedup must
+                // read the full source ID at the scanner's unquoted offset.
+                keys.push((11 << (RAW_EVENT_OFFSET_BITS + 4)) | (offset as u64) << 4 | RAW_EVENT_TAG);
+            });
+            keys
+        };
+        let keys = scanned_keys(true);
+        assert_eq!(keys, scanned_keys(false));
+        let [key_a, key_b] = keys[..] else { panic!("expected two well-formed events") };
+        assert_eq!(source_event_id(&bytes, key_a >> 4), raw_a);
+        assert_eq!(source_event_id(&bytes, key_b >> 4), raw_b);
         for streaming in [true, false] {
             let mut chunks = [chunk_with(1), chunk_with(2)];
             chunks[0].toks = vec![
@@ -3275,6 +3542,33 @@ mod tests {
 
     #[test]
     fn source_click_ids_preserve_tie_winners_and_all_assist_campaigns() {
+        for fast_scan in [false, true] {
+            check_source_click_ties(fast_scan);
+        }
+    }
+
+    #[test]
+    fn scanners_agree_across_pipeline_chunks() {
+        let mut bytes = b"id,user,campaign,ts\n".to_vec();
+        bytes.resize(CHUNK_BYTES - 7, b'x');
+        bytes.extend_from_slice(b"\n\"edge\",u,c,t\n\"\",u,c,t\n\"bad,u,c,t\nnext,u,c,t\r");
+        let chunks = chunk_files(&[&bytes]);
+        assert_eq!(chunks.len(), 2);
+        let spans = |fast| {
+            let mut records = Vec::new();
+            for chunk in &chunks {
+                crate::scan3::for_each_record::<4>(chunk.bytes, chunk.has_header, fast, |fields| {
+                    records.push(fields.map(|field| (field.as_ptr() as usize, field.len())));
+                });
+            }
+            records
+        };
+        let records = spans(true);
+        assert_eq!(records, spans(false));
+        assert_eq!(records.len(), 3);
+    }
+
+    fn check_source_click_ties(fast_scan: bool) {
         let files: [&[u8]; 2] = [
             b"id,user,campaign,ts\nz,u,1,5\n\"A \"  ,u,99,5\n\"A \"\",u,99,5\n\"B\",u,2,2\n\"Aa\",u,5,5\n",
             b"id,user,campaign,ts\n\"A \",\"u\",3,5\nA ,u,3,5\n0,u,4,2\nvery-long-fallback-key,u,6,7",
@@ -3284,7 +3578,7 @@ mod tests {
         let mut interned = Vec::new();
         let mut source = Vec::new();
         for (i, chunk) in chunks.iter().enumerate() {
-            crate::scan3::for_each_record::<4>(chunk.bytes, chunk.has_header, |fields| {
+            crate::scan3::for_each_record::<4>(chunk.bytes, chunk.has_header, fast_scan, |fields| {
                 let id = fields[0];
                 let camp = std::str::from_utf8(fields[2]).unwrap().parse().unwrap();
                 let ts_rel = std::str::from_utf8(fields[3]).unwrap().parse().unwrap();
@@ -3396,6 +3690,7 @@ mod tests {
                 ck_chunks.push(CkChunk { cks: all_cks, ck_off, has_fallback_click: false });
             }
             let pc = PersonCtx {
+                ascii_users: false,
                 base,
                 ids: &ids,
                 cat_names: &cat_names,

@@ -22,7 +22,7 @@ use rayon::prelude::*;
 
 use crate::csvline::split_fields;
 use crate::hash::fmix64;
-use crate::key::{key_cmp, key_of, IdInterner, IdKey};
+use crate::key::{key_cmp, key_of, user_key_cmp, user_key_of, IdInterner, IdKey};
 
 const CHUNK_BYTES: usize = 1 << 18;
 
@@ -81,6 +81,14 @@ fn home_slot(key: IdKey, mask: usize) -> usize {
     fmix64(key ^ 0x6c69_6e6b_7332_5f6b) as usize & mask
 }
 
+/// One folded multiply gives the alias lookup its index and supplies the high
+/// bits for person routing. Every candidate still compares the full key.
+#[inline(always)]
+pub(crate) fn alias_hash(key: IdKey) -> u64 {
+    let product = u128::from(key ^ 0x7065_7273_6f6e_7633) * 0xa076_1d64_78bd_642f;
+    product as u64 ^ (product >> 64) as u64
+}
+
 fn table_capacity(len: usize) -> usize {
     (len + len.div_ceil(3)).next_power_of_two().max(16)
 }
@@ -104,8 +112,8 @@ unsafe fn zeroed_vec<T>(len: usize) -> Vec<T> {
 }
 
 /// Concurrent key -> slot table. A slot word holds `key + 1`; 0 means empty.
-/// `key + 1` never wraps: a key's low nibble is 0..=10, so it is never
-/// `u64::MAX`.
+/// `key + 1` never wraps: the regular key format uses low nibbles 0..=10,
+/// and the ASCII user format's five-bit prefix code is always at most 25.
 struct KeyTable {
     keys: Vec<AtomicU64>,
     mask: usize,
@@ -169,15 +177,22 @@ impl Forest<'_> {
         }
     }
 
-    fn union(&self, a: u32, b: u32, interner: &IdInterner) {
+    fn union<const ALIASES_ONLY: bool>(&self, a: u32, b: u32, interner: &IdInterner) -> bool {
         let (mut a, mut b) = (a, b);
         loop {
             a = self.find(a);
             b = self.find(b);
             if a == b {
-                return;
+                return false;
             }
-            let (lo, hi) = if key_cmp(self.table.key(a), self.table.key(b), interner).is_lt() {
+            let a_key = self.table.key(a);
+            let b_key = self.table.key(b);
+            let order = if ALIASES_ONLY {
+                user_key_cmp(a_key, b_key, interner)
+            } else {
+                key_cmp(a_key, b_key, interner)
+            };
+            let (lo, hi) = if order.is_lt() {
                 (a, b)
             } else {
                 (b, a)
@@ -189,9 +204,26 @@ impl Forest<'_> {
                 .compare_exchange(0, lo + 1, Relaxed, Relaxed)
                 .is_ok()
             {
-                return;
+                return true;
             }
         }
+    }
+
+    fn for_each_name<const ALIASES_ONLY: bool>(&self, insert: impl Fn(u64, IdKey) + Send + Sync) {
+        self.table
+            .keys
+            .par_iter()
+            .enumerate()
+            .with_min_len(4096)
+            .for_each(|(slot, word)| {
+                let stored = word.load(Relaxed);
+                if stored != 0 {
+                    let root = self.find(slot as u32);
+                    if !ALIASES_ONLY || root as usize != slot {
+                        insert(stored, self.table.key(root));
+                    }
+                }
+            });
     }
 }
 
@@ -202,6 +234,12 @@ struct Slot {
     /// loads compile to plain loads.
     key: AtomicU64,
     value: AtomicU64,
+}
+
+#[repr(C, align(64))]
+struct Bucket {
+    keys: [AtomicU64; 4],
+    values: [AtomicU64; 4],
 }
 
 /// Linked ID -> byte-wise smallest ID in its transitive component.
@@ -257,6 +295,108 @@ impl PersonMap {
     }
 }
 
+/// Read-only after links finish. Roots and unlinked IDs already name
+/// themselves, so this table stores only IDs that actually change names.
+pub(crate) struct AliasMap {
+    buckets: Vec<Bucket>,
+    filter: Vec<AtomicU64>,
+    mask: usize,
+}
+
+impl AliasMap {
+    #[inline(always)]
+    fn filter_bit(&self, hash: u64) -> (&AtomicU64, u64) {
+        let word = &self.filter[hash as usize & (self.filter.len() - 1)];
+        let bit = 1u64 << ((hash >> 32) & 63);
+        (word, bit)
+    }
+
+    /// A missing bit rules out an alias. A set bit still requires a full key
+    /// comparison in the name table.
+    #[inline(always)]
+    pub(crate) fn may_contain(&self, hash: u64) -> bool {
+        let (word, bit) = self.filter_bit(hash);
+        word.load(Relaxed) & bit != 0
+    }
+
+    #[inline(always)]
+    pub(crate) fn prefetch(&self, hash: u64) {
+        let index = hash as usize & self.mask;
+        prefetch_read(self.buckets.as_ptr().wrapping_add(index).cast());
+    }
+
+    #[inline(always)]
+    pub(crate) fn resolve(&self, key: IdKey, hash: u64) -> IdKey {
+        let stored = key + 1;
+        let mut index = hash as usize & self.mask;
+        loop {
+            let bucket = &self.buckets[index];
+            if let Some(lane) = bucket.find(stored) {
+                return bucket.values[lane].load(Relaxed);
+            }
+            // Build fills lanes from left to right. An empty last lane means
+            // that no key probed past this bucket.
+            if bucket.keys[3].load(Relaxed) == 0 {
+                return key;
+            }
+            index = (index + 1) & self.mask;
+        }
+    }
+
+    fn insert(&self, stored: u64, name: IdKey) {
+        let hash = alias_hash(stored - 1);
+        let (word, bit) = self.filter_bit(hash);
+        word.fetch_or(bit, Relaxed);
+        let mut index = hash as usize & self.mask;
+        loop {
+            let bucket = &self.buckets[index];
+            for (key, value) in bucket.keys.iter().zip(&bucket.values) {
+                if key.load(Relaxed) == 0
+                    && key.compare_exchange(0, stored, Relaxed, Relaxed).is_ok()
+                {
+                    value.store(name, Relaxed);
+                    return;
+                }
+            }
+            index = (index + 1) & self.mask;
+        }
+    }
+}
+
+impl Bucket {
+    /// Reader-only: after the parallel build joins, none of the key words are
+    /// ever written again. Four keys fit in one AVX2 load.
+    #[inline(always)]
+    fn find(&self, stored: u64) -> Option<usize> {
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+        // SAFETY: this is an aligned read of the bucket's four immutable keys.
+        unsafe {
+            use core::arch::x86_64::*;
+            let keys = _mm256_load_si256(self.keys.as_ptr().cast());
+            let matching = _mm256_cmpeq_epi64(keys, _mm256_set1_epi64x(stored as i64));
+            let mask = _mm256_movemask_pd(_mm256_castsi256_pd(matching)) as u32;
+            (mask != 0).then(|| mask.trailing_zeros() as usize)
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: both vector loads are within the four immutable key words.
+        unsafe {
+            use core::arch::aarch64::*;
+            let ptr = self.keys.as_ptr().cast::<u64>();
+            let target = vdupq_n_u64(stored);
+            let a = vmovn_u64(vceqq_u64(vld1q_u64(ptr), target));
+            let b = vmovn_u64(vceqq_u64(vld1q_u64(ptr.add(2)), target));
+            // Each comparison occupies 16 bits in the final lane mask.
+            let matches = vreinterpret_u64_u16(vshrn_n_u32::<16>(vcombine_u32(a, b)));
+            let mask = vget_lane_u64::<0>(matches);
+            (mask != 0).then(|| mask.trailing_zeros() as usize / 16)
+        }
+        #[cfg(not(any(target_arch = "aarch64", all(target_arch = "x86_64", target_feature = "avx2"))))]
+        {
+            self.keys.iter().position(|key| key.load(Relaxed) == stored)
+        }
+    }
+}
+
 /// Software prefetch of one cache line into L1 (no-op on other targets).
 #[inline(always)]
 fn prefetch_read(ptr: *const u8) {
@@ -297,6 +437,50 @@ impl Timer {
 /// `interner` must also be used for keys passed to `PersonMap::get` and for
 /// decoding returned fallback keys.
 pub fn build(link_files: &[&[u8]], interner: &IdInterner) -> PersonMap {
+    build_names::<false, _>(link_files, interner, |forest, len| {
+        let capacity = table_capacity(len);
+        let mask = capacity - 1;
+        // SAFETY: all-zero bytes represent an empty slot.
+        let slots: Vec<Slot> = unsafe { zeroed_vec(capacity) };
+        forest.for_each_name::<false>(|stored, name| {
+            let mut at = home_slot(stored - 1, mask);
+            loop {
+                let target = &slots[at];
+                if target.key.compare_exchange(0, stored, Relaxed, Relaxed).is_ok() {
+                    target.value.store(name, Relaxed);
+                    return;
+                }
+                at = (at + 1) & mask;
+            }
+        });
+        PersonMap { slots, mask, len }
+    })
+}
+
+/// Build the alias-only map with the v3 user key encoding. Queries and output
+/// use the same interner and encoding as the link endpoints.
+pub(crate) fn build_aliases(link_files: &[&[u8]], interner: &IdInterner) -> AliasMap {
+    build_names::<true, _>(link_files, interner, |forest, aliases| {
+        let capacity = table_capacity(aliases);
+        let bucket_count = capacity / 4;
+        // Four filter bits per slot. The bitset rejects most unchanged IDs
+        // without loading a bucket, and collisions only cause extra probes.
+        // SAFETY: zero denotes an empty bucket and an unset filter word.
+        let map = AliasMap {
+            buckets: unsafe { zeroed_vec(bucket_count) },
+            filter: unsafe { zeroed_vec((capacity / 16).max(1)) },
+            mask: bucket_count - 1,
+        };
+        forest.for_each_name::<true>(|stored, name| map.insert(stored, name));
+        map
+    })
+}
+
+fn build_names<const ALIASES_ONLY: bool, T>(
+    link_files: &[&[u8]],
+    interner: &IdInterner,
+    finalize: impl FnOnce(&Forest<'_>, usize) -> T,
+) -> T {
     let mut timer = Timer {
         enabled: std::env::var_os("FAST_TIMING").is_some(),
         last: Instant::now(),
@@ -335,14 +519,23 @@ pub fn build(link_files: &[&[u8]], interner: &IdInterner) -> PersonMap {
                 {
                     return;
                 }
-                let (a, new_a) = table.insert(key_of(fields[0], interner));
-                let (b, new_b) = table.insert(key_of(fields[1], interner));
+                let encode = |id| {
+                    if ALIASES_ONLY {
+                        user_key_of(id, interner)
+                    } else {
+                        key_of(id, interner)
+                    }
+                };
+                let (a, new_a) = table.insert(encode(fields[0]));
+                let (b, new_b) = table.insert(encode(fields[1]));
                 inserted += new_a as usize + new_b as usize;
                 if a != b {
                     edges.push((a, b));
                 }
             });
-            distinct.fetch_add(inserted, Relaxed);
+            if !ALIASES_ONLY {
+                distinct.fetch_add(inserted, Relaxed);
+            }
             edges
         })
         .collect();
@@ -354,56 +547,65 @@ pub fn build(link_files: &[&[u8]], interner: &IdInterner) -> PersonMap {
         parent: unsafe { zeroed_vec(table.keys.len()) },
         table: &table,
     };
-    edges.par_iter().for_each(|chunk_edges| {
-        for &(a, b) in chunk_edges {
-            forest.union(a, b, interner);
-        }
-    });
+    // Every successful union installs one new non-root parent. This counts the
+    // exact aliases without rescanning the forest to size the final table.
+    let aliases: usize = edges
+        .par_iter()
+        .map(|chunk_edges| {
+            let mut joined = 0;
+            for &(a, b) in chunk_edges {
+                joined += forest.union::<ALIASES_ONLY>(a, b, interner) as usize;
+            }
+            joined
+        })
+        .sum();
     drop(edges);
     timer.mark("union");
 
-    // Phase 3: resolve every occupied slot to its root's key and insert into a
-    // compact final table. Final keys are unique, so each insert claims the
-    // first empty slot it meets; the value is published before `build`
-    // returns (the parallel loop is a barrier).
-    let capacity = table_capacity(len);
-    let mask = capacity - 1;
-    // Safety: all-zero bytes are a valid (empty) `Slot`.
-    let slots: Vec<Slot> = unsafe { zeroed_vec(capacity) };
-    table
-        .keys
-        .par_iter()
-        .enumerate()
-        .with_min_len(4096)
-        .for_each(|(slot, word)| {
-            let stored = word.load(Relaxed);
-            if stored == 0 {
-                return;
-            }
-            let name = table.key(forest.find(slot as u32));
-            let mut at = home_slot(stored - 1, mask);
-            loop {
-                let target = &slots[at];
-                if target
-                    .key
-                    .compare_exchange(0, stored, Relaxed, Relaxed)
-                    .is_ok()
-                {
-                    target.value.store(name, Relaxed);
-                    return;
-                }
-                at = (at + 1) & mask;
-            }
-        });
+    // Phase 3 publishes the exact names after all union threads have joined.
+    let names = finalize(&forest, if ALIASES_ONLY { aliases } else { len });
     timer.mark("name map");
-
-    PersonMap { slots, mask, len }
+    names
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::key::key_bytes;
+    use crate::key::{key_bytes, user_key_bytes};
+
+    #[test]
+    fn alias_buckets_check_full_keys_when_the_last_bucket_wraps() {
+        let old_ids = IdInterner::with_hex_log2(6);
+        let new_ids = IdInterner::with_hex_log2(6);
+        let colliders: Vec<_> = (0..1000)
+            .map(|i| format!("q{i:08}"))
+            .filter(|id| alias_hash(user_key_of(id.as_bytes(), &new_ids)) & 3 == 3)
+            .take(7)
+            .collect();
+        assert_eq!(colliders.len(), 7);
+        let mut links = String::from("a,b\n");
+        for alias in &colliders[..6] {
+            links.push_str(&format!("{alias},a_root\n"));
+        }
+        links.push_str("a_root,a_root\n");
+        let input = [links.as_bytes()];
+        let old = build(&input, &old_ids);
+        let new = build_aliases(&input, &new_ids);
+        assert_eq!(new.mask, 3);
+        let mut old_bytes = Vec::new();
+        let mut new_bytes = Vec::new();
+        for id in colliders.iter().map(String::as_bytes).chain([b"a_root".as_slice()]) {
+            let legacy = key_of(id, &old_ids);
+            let legacy = old.get(legacy).unwrap_or(legacy);
+            let key = user_key_of(id, &new_ids);
+            let hash = alias_hash(key);
+            let resolved = if new.may_contain(hash) { new.resolve(key, hash) } else { key };
+            assert_eq!(
+                user_key_bytes(resolved, &new_ids, &mut new_bytes),
+                key_bytes(legacy, &old_ids, &mut old_bytes),
+            );
+        }
+    }
 
     fn named(map: &PersonMap, interner: &IdInterner, id: &[u8]) -> Option<Vec<u8>> {
         let name = map.get(key_of(id, interner))?;

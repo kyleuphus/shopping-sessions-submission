@@ -21,8 +21,8 @@ use crate::hexid::{self, HexTable, HEX_ID_LEN};
 /// exact fallback and the upper 60 bits hold its index in [`IdInterner`]:
 /// bit 63 set ([`HEX_TAG`]) = slot index in the lock-free hex table (bits
 /// 4..=31 hold it); bit 63 clear = sharded-interner index in bits 4..=35.
-/// Outside this file, fallback keys are only tested with `key & 0x0f == 0`,
-/// hashed, or compared for equality, never decoded.
+/// The v3 user path also accepts a raw ASCII representation produced by
+/// `user_key_of` and decoded by `user_key_bytes`.
 pub type IdKey = u64;
 
 /// Fallback-key tag for IDs held in the [`HexTable`].
@@ -195,6 +195,106 @@ pub fn key_of(bytes: &[u8], interner: &IdInterner) -> IdKey {
     match pack(bytes) {
         Some(key) => key,
         None => interner.fallback_key(bytes),
+    }
+}
+
+const ASCII_BYTES: u64 = 0x7f7f_7f7f_7f7f_7f7f;
+const USER_ASCII_TAG: u64 = (1 << 55) | (1 << 15) | (1 << 7);
+const USER_PREFIX_MASK: u64 = !ASCII_BYTES ^ USER_ASCII_TAG;
+const USER_ESCAPED_PACKED_TAG: u64 = 11;
+const USER_ESCAPED_BIT: u64 = 1 << 7;
+const USER_PREFIX: [u64; 26] = {
+    let mut prefixes = [0; 26];
+    let mut i = 0;
+    while i < prefixes.len() {
+        let c = i as u64;
+        prefixes[i] = USER_ASCII_TAG
+            | ((c & 16) << 59)
+            | ((c & 8) << 44)
+            | ((c & 4) << 37)
+            | ((c & 2) << 30)
+            | ((c & 1) << 23);
+        i += 1;
+    }
+    prefixes
+};
+
+/// Store eight ASCII suffix bytes verbatim. Each byte leaves a spare high
+/// bit, so five bits hold the lowercase prefix and three tag this user key.
+#[inline]
+pub(crate) fn user_key_of(bytes: &[u8], interner: &IdInterner) -> IdKey {
+    if bytes.len() == 9 {
+        let prefix = bytes[0].wrapping_sub(b'a');
+        let raw = u64::from_be_bytes(bytes[1..].try_into().unwrap());
+        if prefix < 26 && raw & !ASCII_BYTES == 0 {
+            return raw | USER_PREFIX[usize::from(prefix)];
+        }
+    }
+    let key = key_of(bytes, interner);
+    // Bit 7 is padding in packed keys of at most nine bytes. Bit 55
+    // is unused in interned keys. For a packed ten-byte ID that has
+    // all three marker bits set, clear bit 7 and use an unused length tag.
+    if is_user_ascii(key) {
+        (key & !(USER_ESCAPED_BIT | 15)) | USER_ESCAPED_PACKED_TAG
+    } else {
+        key
+    }
+}
+
+#[inline]
+fn user_ascii_bytes(key: IdKey) -> [u8; 9] {
+    let prefix = ((key >> 59) & 16)
+        | ((key >> 44) & 8)
+        | ((key >> 37) & 4)
+        | ((key >> 30) & 2)
+        | ((key >> 23) & 1);
+    let mut bytes = [0; 9];
+    bytes[0] = b'a' + prefix as u8;
+    bytes[1..].copy_from_slice(&(key & ASCII_BYTES).to_be_bytes());
+    bytes
+}
+
+#[inline(always)]
+fn is_user_ascii(key: IdKey) -> bool {
+    key & USER_ASCII_TAG == USER_ASCII_TAG
+}
+
+#[inline]
+fn unescape_user_key(key: IdKey) -> IdKey {
+    if key & 15 == USER_ESCAPED_PACKED_TAG {
+        (key & !15) | USER_ESCAPED_BIT | 10
+    } else {
+        key
+    }
+}
+
+pub(crate) fn user_key_bytes<'a>(
+    key: IdKey,
+    interner: &IdInterner,
+    buf: &'a mut Vec<u8>,
+) -> &'a [u8] {
+    if is_user_ascii(key) {
+        buf.clear();
+        buf.extend_from_slice(&user_ascii_bytes(key));
+        buf
+    } else {
+        key_bytes(unescape_user_key(key), interner, buf)
+    }
+}
+
+#[inline]
+pub(crate) fn user_key_cmp(a: IdKey, b: IdKey, interner: &IdInterner) -> Ordering {
+    match (is_user_ascii(a), is_user_ascii(b)) {
+        // Positions of the prefix bits run from most to least significant.
+        // After equal prefixes, the full words compare in suffix byte order.
+        (true, true) => (a & USER_PREFIX_MASK).cmp(&(b & USER_PREFIX_MASK)).then_with(|| a.cmp(&b)),
+        (true, false) => user_ascii_bytes(a)
+            .as_slice()
+            .cmp(KeyBytes::new(unescape_user_key(b), interner).as_slice()),
+        (false, true) => KeyBytes::new(unescape_user_key(a), interner)
+            .as_slice()
+            .cmp(user_ascii_bytes(b).as_slice()),
+        (false, false) => key_cmp(unescape_user_key(a), unescape_user_key(b), interner),
     }
 }
 
@@ -438,6 +538,45 @@ mod tests {
     const SUBSET: [u8; 10] = [b'-', b'0', b'9', b'A', b'Z', b'_', b'a', b'z', b'5', b'm'];
     const MIXED: &[u8] =
         b"-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz \"\r\xc3\xff.+";
+
+    #[test]
+    fn raw_user_keys_roundtrip_and_compare_exact_bytes() {
+        let interner = IdInterner::with_hex_log2(6);
+        let mut buf = Vec::new();
+        for prefix in b'a'..=b'z' {
+            for index in 1..9 {
+                for byte in 0..=127 {
+                    let mut id = *b"x12345678";
+                    id[0] = prefix;
+                    id[index] = byte;
+                    let key = user_key_of(&id, &interner);
+                    assert!(is_user_ascii(key));
+                    assert_ne!(key, u64::MAX);
+                    assert_eq!(user_key_bytes(key, &interner, &mut buf), id);
+                }
+            }
+        }
+
+        // The packed ten-byte word would use all three raw ASCII tag bits.
+        let ten = b"zzzzzzzzzz";
+        assert!(is_user_ascii(pack(ten).unwrap()));
+        assert!(!is_user_ascii(user_key_of(ten, &interner)));
+        let ids: &[&[u8]] = &[
+            ten, b"zzzzzzzzz", b"q00000000", b"pzzzzzzzz", b"p123\r5678",
+            b"p123 5678", b"P12345678", b"p12345678", b"p1234567", b"p123456789",
+            b"p12\xc3\xa95678", b"u00000000000000000000000000000000",
+            b"u00000000000000000000000000000001", b"u0000000000000000000000000000000g",
+        ];
+        for &a in ids {
+            let a_key = user_key_of(a, &interner);
+            assert_eq!(user_key_bytes(a_key, &interner, &mut buf), a);
+            for &b in ids {
+                let b_key = user_key_of(b, &interner);
+                assert_eq!(a_key == b_key, a == b);
+                assert_eq!(user_key_cmp(a_key, b_key, &interner), a.cmp(b));
+            }
+        }
+    }
 
     fn unpacked(k: u64) -> Vec<u8> {
         let mut buf = [0; 10];
