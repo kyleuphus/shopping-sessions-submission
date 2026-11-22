@@ -29,6 +29,7 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, Date32Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use parquet::arrow::arrow_writer::ArrowWriterOptions;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
@@ -59,11 +60,15 @@ pub struct CampaignDailyRow<'a> {
 
 /// `counts` is the type of the count columns: `Int32` or `Int64` (see `count_type`).
 pub fn user_daily_schema(counts: DataType) -> Schema {
+    user_daily_schema_counts(counts.clone(), counts)
+}
+
+fn user_daily_schema_counts(sessions: DataType, events: DataType) -> Schema {
     Schema::new(vec![
         Field::new("user_id", DataType::Utf8, false),
         Field::new("day", DataType::Date32, false),
-        Field::new("sessions", counts.clone(), false),
-        Field::new("events", counts, false),
+        Field::new("sessions", sessions, false),
+        Field::new("events", events, false),
         Field::new("revenue_cents", DataType::Int64, false),
         Field::new("top_category", DataType::Utf8, true),
     ])
@@ -111,17 +116,48 @@ fn write_batch(
     schema: Schema,
     columns: Vec<ArrayRef>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    write_batch_inner(dir, part, schema, columns, false)
+}
+
+fn write_batch_inner(
+    dir: &Path,
+    part: usize,
+    schema: Schema,
+    columns: Vec<ArrayRef>,
+    walk: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(dir)?;
     let schema = Arc::new(schema);
     let batch = RecordBatch::try_new(schema.clone(), columns)?;
     let file = File::create(dir.join(format!("part-{part}.parquet")))?;
     static VARIANT: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     let variant = VARIANT.get_or_init(|| std::env::var("FAST_PQ").ok());
-    let props = writer_properties(variant.as_deref());
+    let mut props = writer_properties(variant.as_deref());
+    static WALK_PQ: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let tune = if walk { WALK_PQ.get_or_init(|| std::env::var("FAST_WALK_PQ").ok()).as_deref() } else { None };
+    if matches!(tune, Some("batch" | "shape" | "nodict")) {
+        use parquet::basic::Encoding;
+        use parquet::schema::types::ColumnPath;
+        let mut builder = props.into_builder().set_write_batch_size(8192);
+        if tune == Some("shape") {
+            for column in ["user_id", "sessions", "events", "revenue_cents"] {
+                builder = builder.set_column_encoding(ColumnPath::from(column), Encoding::PLAIN);
+            }
+        } else if tune == Some("nodict") {
+            for column in ["day", "top_category"] {
+                builder = builder.set_column_dictionary_enabled(ColumnPath::from(column), false);
+            }
+        }
+        props = builder.build();
+    }
     // A second handle to the same open file, kept so write-back can be started
     // after the writer (which owns `file`) has closed it.
     let sync_handle = if sync_enabled() { Some(file.try_clone()?) } else { None };
-    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    let mut writer = ArrowWriter::try_new_with_options(
+        file,
+        schema,
+        ArrowWriterOptions::new().with_properties(props).with_skip_arrow_metadata(tune.is_some()),
+    )?;
     writer.write(&batch)?;
     writer.close()?;
     if let Some(handle) = sync_handle {
@@ -238,12 +274,15 @@ pub fn write_user_daily<'r, 'a: 'r>(
 #[derive(Default)]
 pub struct UserDailyCols {
     /// Concatenated user_id bytes. Always valid UTF-8 (each name is pushed from a `&str`).
-    pub names: Vec<u8>,
+    names: Vec<u8>,
     /// `len() + 1` entries starting at 0 once any row is pushed (empty when no rows).
-    pub offsets: Vec<i32>,
+    offsets: Vec<i32>,
     pub day: Vec<i32>,
-    pub sessions: Vec<i64>,
-    pub events: Vec<i64>,
+    sessions: Vec<i64>,
+    events: Vec<i64>,
+    /// FAST_WALK knows the count bounds when appending, so the columns can
+    /// move into Arrow without scanning the rows for their integer widths.
+    narrow_counts: Option<(Vec<i32>, Vec<i32>)>,
     pub revenue_cents: Vec<i64>,
     pub top: Vec<u16>,
 }
@@ -252,6 +291,13 @@ pub struct UserDailyCols {
 pub const TOP_NULL: u16 = u16::MAX;
 
 impl UserDailyCols {
+    pub(crate) fn for_walk(fast_walk: bool) -> Self {
+        Self {
+            narrow_counts: fast_walk.then(Default::default),
+            ..Self::default()
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.day.len()
     }
@@ -265,6 +311,14 @@ impl UserDailyCols {
         self.names.len()
     }
 
+    pub(crate) fn sums(&self) -> (i64, i64) {
+        let sessions = match &self.narrow_counts {
+            Some((sessions, _)) => sessions.iter().copied().map(i64::from).sum(),
+            None => self.sessions.iter().sum(),
+        };
+        (sessions, self.revenue_cents.iter().sum())
+    }
+
     #[inline]
     pub fn push(&mut self, user_id: &str, day: i32, sessions: i64, events: i64, revenue_cents: i64, top: u16) {
         if self.offsets.is_empty() {
@@ -276,10 +330,34 @@ impl UserDailyCols {
         // rather than a silently wrong offset.
         self.offsets.push(i32::try_from(self.names.len()).expect("user_id buffer exceeds i32 offsets"));
         self.day.push(day);
-        self.sessions.push(sessions);
-        self.events.push(events);
+        if let Some((session_col, event_col)) = &mut self.narrow_counts {
+            // A day has at most 48 session starts (gaps strictly over 30
+            // minutes). A person-day with 2^31 events would need an input of
+            // hundreds of GB, far beyond the scorer's 24 GB box. Both stay
+            // signed Int32 (the base path's type) so the checker sees the
+            // same Parquet types as before.
+            session_col.push(i32::try_from(sessions).expect("daily sessions exceed i32"));
+            event_col.push(i32::try_from(events).expect("daily events exceed i32"));
+        } else {
+            self.sessions.push(sessions);
+            self.events.push(events);
+        }
         self.revenue_cents.push(revenue_cents);
         self.top.push(top);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn user_name(&self, row: usize) -> String {
+        let bytes = &self.names[self.offsets[row] as usize..self.offsets[row + 1] as usize];
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counts(&self, row: usize) -> (i64, i64) {
+        match &self.narrow_counts {
+            Some((sessions, events)) => (i64::from(sessions[row]), i64::from(events[row])),
+            None => (self.sessions[row], self.events[row]),
+        }
     }
 }
 
@@ -292,23 +370,41 @@ pub fn write_user_daily_cols(
     cat_names: &[Cow<'_, str>],
 ) -> Result<(), Box<dyn std::error::Error>> {
     use arrow::buffer::{Buffer, OffsetBuffer, ScalarBuffer};
-    let UserDailyCols { names, mut offsets, day, sessions, events, revenue_cents, top } = cols;
+    let UserDailyCols { names, mut offsets, day, sessions, events, narrow_counts, revenue_cents, top } = cols;
     if offsets.is_empty() {
         offsets.push(0);
     }
-    let counts = count_type(sessions.iter().chain(events.iter()).copied());
-    // `try_new` checks the offsets and that the bytes are valid UTF-8, so a
-    // bug upstream fails loudly instead of writing a corrupt file.
-    let user_id = StringArray::try_new(
-        OffsetBuffer::new(ScalarBuffer::from(offsets)),
-        Buffer::from_vec(names),
-        None,
-    )?;
+    let offsets = ScalarBuffer::from(offsets);
+    let names = Buffer::from_vec(names);
+    let walk = narrow_counts.is_some();
+    let (user_id, schema, sessions, events): (_, _, ArrayRef, ArrayRef) = match narrow_counts {
+        Some((sessions, events)) => {
+            // SAFETY: offsets start at zero and only advance by the length of
+            // the str appended in push. Each range is therefore in bounds and
+            // valid UTF-8. Both buffers are private to UserDailyCols.
+            let user_id = unsafe { StringArray::new_unchecked(OffsetBuffer::new_unchecked(offsets), names, None) };
+            (
+                user_id,
+                user_daily_schema(DataType::Int32),
+                Arc::new(Int32Array::new(ScalarBuffer::from(sessions), None)),
+                Arc::new(Int32Array::new(ScalarBuffer::from(events), None)),
+            )
+        }
+        None => {
+            let counts = count_type(sessions.iter().chain(events.iter()).copied());
+            (
+                StringArray::try_new(OffsetBuffer::new(offsets), names, None)?,
+                user_daily_schema(counts.clone()),
+                count_column(&counts, sessions.iter().copied()),
+                count_column(&counts, events.iter().copied()),
+            )
+        }
+    };
     let columns: Vec<ArrayRef> = vec![
         Arc::new(user_id),
         Arc::new(Date32Array::new(ScalarBuffer::from(day), None)),
-        count_column(&counts, sessions.iter().copied()),
-        count_column(&counts, events.iter().copied()),
+        sessions,
+        events,
         Arc::new(Int64Array::new(ScalarBuffer::from(revenue_cents), None)),
         Arc::new(StringArray::from_iter(top.iter().map(|&t| {
             if t == TOP_NULL {
@@ -318,7 +414,7 @@ pub fn write_user_daily_cols(
             }
         }))),
     ];
-    write_batch(dir, part, user_daily_schema(counts), columns)
+    write_batch_inner(dir, part, schema, columns, walk)
 }
 
 pub fn write_campaign_daily(
@@ -426,6 +522,25 @@ mod tests {
         assert!(dir.join("user_daily/part-0.parquet").is_file());
         assert!(dir.join("campaign_daily/part-0.parquet").is_file());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn walk_columns_round_trip_narrow_event_counts_and_null_categories() {
+        let dir = std::env::temp_dir().join(format!("fast-walk-cols-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cols = UserDailyCols::for_walk(true);
+        cols.push("a UTF-8 🦀", 20_000, 1, i64::from(i32::MAX), 0, TOP_NULL);
+        cols.push("b", 20_001, 2, 3, 5, 0);
+        assert_eq!(cols.sums(), (3, 5));
+        write_user_daily_cols(&dir, 0, cols, &[Cow::Borrowed("")]).unwrap();
+        let batch = read_back(&dir.join("part-0.parquet"));
+        assert_eq!(batch.column(0).as_any().downcast_ref::<StringArray>().unwrap().value(0), "a UTF-8 🦀");
+        assert_eq!(batch.schema().field(1).data_type(), &DataType::Date32);
+        assert_eq!(batch.column(3).as_any().downcast_ref::<Int32Array>().unwrap().values(), &[i32::MAX, 3]);
+        let top = batch.column(5).as_any().downcast_ref::<StringArray>().unwrap();
+        assert!(top.is_null(0));
+        assert_eq!(top.value(1), "");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
